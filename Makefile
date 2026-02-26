@@ -20,7 +20,7 @@ endif
 # MIR project (for bench target)
 MIR_DIR = $(HOME)/Projects/mir
 
-.PHONY: all clean test
+.PHONY: all clean test test-integration
 
 all: $(TARGET)
 
@@ -53,6 +53,19 @@ test: $(TARGET)
 	@echo "=== Test 4: for loop ==="
 	@echo 'int main() { int s = 0; for (int i = 0; i < 10; i++) s += i; return s; }' > /tmp/test4.c
 	@./$(TARGET) /tmp/test4.c; echo "Exit code: $$?"
+
+test-integration: $(TARGET)
+	@pass=0; fail=0; \
+	for t in tests/*.c; do \
+	  name=$$(basename $$t .c); \
+	  for opt in "" "-O1"; do \
+	    mode=$${opt:-O0}; \
+	    ./$(TARGET) $$opt $$t > /tmp/c2sljit-$$name-$$mode.out 2>/dev/null; \
+	    if diff -q tests/$$name.expected /tmp/c2sljit-$$name-$$mode.out >/dev/null 2>&1; then \
+	      echo "PASS: $$name $$mode"; pass=$$((pass+1)); \
+	    else echo "FAIL: $$name $$mode"; fail=$$((fail+1)); fi; \
+	  done; \
+	done; echo "$$pass passed, $$fail failed"
 
 # Benchmark: c2sljit vs c2mir
 # c2sljit.o and libmir.a both contain the c2mir frontend, which has

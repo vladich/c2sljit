@@ -1,5 +1,5 @@
 /* Benchmark: c2sljit vs c2mir
-   Compiles the same integer-only C programs with both compilers,
+   Compiles the same C programs with both compilers,
    measuring compilation speed and execution speed side-by-side.
 
    Note: we cannot include c2sljit.h here because its mir-compat.h
@@ -11,6 +11,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <dlfcn.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 /* c2mir / MIR (real headers) */
 #include "mir.h"
@@ -34,8 +36,21 @@ struct c2sljit_options {
   int debug_p, verbose_p, ignore_warnings_p, no_prepro_p, prepro_only_p;
   int syntax_only_p, pedantic_p;
   int opt_mem_operands_p;
-  int opt_reg_cache_p, opt_cmp_branch_p;
-  int opt_strength_reduce_p, opt_magic_div_p, opt_commute_p, opt_smart_regs_p, opt_defer_store_p;
+  int opt_reg_cache_p;
+  int opt_cmp_branch_p;
+  int opt_strength_reduce_p;
+  int opt_magic_div_p;
+  int opt_commute_p;
+  int opt_smart_regs_p;
+  int opt_defer_store_p;
+  int opt_float_promote_p;
+  int opt_float_cache_p;
+  int opt_ind_cache_p;
+  int opt_inline_p;
+  int opt_float_chain_p;
+  int opt_addr_cache_p;
+  int opt_fmadd_p;
+  int opt_float_field_cache_p;
   size_t module_num;
   FILE *prepro_output_file;
   const char *output_file_name;
@@ -104,10 +119,30 @@ static int mir_getc (void *data) {
   return inp->pos >= inp->len ? EOF : (unsigned char) inp->code[inp->pos++];
 }
 
-/* ---- Import resolver for MIR (programs have no external calls) ---- */
+/* ---- Import resolver ---- */
 
 static void *import_resolver (const char *name) {
   return dlsym (RTLD_DEFAULT, name);
+}
+
+/* ---- stdout suppression for programs that print output ---- */
+
+static int saved_stdout_fd = -1;
+static int devnull_fd = -1;
+
+static void suppress_stdout (void) {
+  fflush (stdout);
+  saved_stdout_fd = dup (STDOUT_FILENO);
+  devnull_fd = open ("/dev/null", O_WRONLY);
+  dup2 (devnull_fd, STDOUT_FILENO);
+  close (devnull_fd);
+}
+
+static void restore_stdout (void) {
+  fflush (stdout);
+  dup2 (saved_stdout_fd, STDOUT_FILENO);
+  close (saved_stdout_fd);
+  saved_stdout_fd = -1;
 }
 
 /* ---- Benchmark result ---- */
@@ -121,7 +156,8 @@ struct bench_result {
 
 /* ---- Run benchmark via c2sljit ---- */
 
-static struct bench_result run_c2sljit (const char *name, const char *source, int opt_p) {
+static struct bench_result run_c2sljit (const char *name, const char *source,
+                                        int opt_p, int has_output) {
   struct bench_result r = {0, 0, -1, 0};
 
   struct c2sljit_mir_context ctx_storage;
@@ -138,6 +174,13 @@ static struct bench_result run_c2sljit (const char *name, const char *source, in
     opts.opt_reg_cache_p = opts.opt_cmp_branch_p = 1;
     opts.opt_strength_reduce_p = opts.opt_commute_p = 1;
     opts.opt_smart_regs_p = opts.opt_defer_store_p = 1;
+    opts.opt_float_promote_p = opts.opt_float_cache_p = 1;
+    opts.opt_ind_cache_p = opts.opt_inline_p = 1;
+    opts.opt_float_chain_p = opts.opt_addr_cache_p = 1;
+    opts.opt_float_field_cache_p = 1;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    opts.opt_fmadd_p = 1;
+#endif
 #if defined(SLJIT_CONFIG_X86_64) && SLJIT_CONFIG_X86_64
     opts.opt_magic_div_p = 1;
 #endif
@@ -154,9 +197,11 @@ static struct bench_result run_c2sljit (const char *name, const char *source, in
   if (ok) {
     c2sljit_main_func_t main_func = c2sljit_get_main (ctx);
     if (main_func != NULL) {
+      if (has_output) suppress_stdout ();
       t0 = real_usec_time ();
       r.result = main_func (0, NULL);
       t1 = real_usec_time ();
+      if (has_output) restore_stdout ();
       r.exec_us = t1 - t0;
       r.ok = 1;
     } else {
@@ -172,7 +217,8 @@ static struct bench_result run_c2sljit (const char *name, const char *source, in
 
 /* ---- Run benchmark via c2mir ---- */
 
-static struct bench_result run_c2mir (const char *name, const char *source) {
+static struct bench_result run_c2mir (const char *name, const char *source,
+                                      int opt_level, int has_output) {
   struct bench_result r = {0, 0, -1, 0};
 
   struct c2mir_options opts;
@@ -216,6 +262,7 @@ static struct bench_result run_c2mir (const char *name, const char *source) {
 
   /* Generate native code */
   MIR_gen_init (ctx);
+  MIR_gen_set_optimize_level (ctx, opt_level);
   MIR_load_external (ctx, "_MIR_flush_code_cache", _MIR_flush_code_cache);
   MIR_link (ctx, MIR_set_gen_interface, import_resolver);
 
@@ -224,9 +271,11 @@ static struct bench_result run_c2mir (const char *name, const char *source) {
 
   /* Execute */
   int (*fun_addr) (int, char **) = (int (*) (int, char **)) main_func->addr;
+  if (has_output) suppress_stdout ();
   t0 = real_usec_time ();
   r.result = fun_addr (0, NULL);
   t1 = real_usec_time ();
+  if (has_output) restore_stdout ();
   r.exec_us = t1 - t0;
   r.ok = 1;
 
@@ -236,7 +285,22 @@ static struct bench_result run_c2mir (const char *name, const char *source) {
   return r;
 }
 
-/* ---- Test programs ---- */
+/* ---- File reading ---- */
+
+static char *read_file (const char *path) {
+  FILE *f = fopen (path, "r");
+  if (!f) return NULL;
+  fseek (f, 0, SEEK_END);
+  long len = ftell (f);
+  fseek (f, 0, SEEK_SET);
+  char *buf = (char *) malloc (len + 1);
+  fread (buf, 1, len, f);
+  buf[len] = '\0';
+  fclose (f);
+  return buf;
+}
+
+/* ---- Test programs (inline — no external calls, integer-only) ---- */
 
 static const char accumulate_src[] =
   "int main() {\n"
@@ -306,15 +370,23 @@ static const char bitops_src[] =
 
 struct benchmark {
   const char *name;
-  const char *source;
+  const char *source;       /* inline source or NULL for file-based */
+  const char *file_path;    /* file path or NULL for inline */
+  int has_output;           /* 1 if program prints to stdout */
 };
 
 static struct benchmark benchmarks[] = {
-  {"accumulate",  accumulate_src},
-  {"collatz",     collatz_src},
-  {"gcd_sum",     gcd_sum_src},
-  {"prime_count", prime_count_src},
-  {"bitops",      bitops_src},
+  {"accumulate",    accumulate_src,  NULL, 0},
+  {"collatz",       collatz_src,     NULL, 0},
+  {"gcd_sum",       gcd_sum_src,     NULL, 0},
+  {"prime_count",   prime_count_src, NULL, 0},
+  {"bitops",        bitops_src,      NULL, 0},
+  {"mandelbrot",    NULL, "tests/mandelbrot.c",    1},
+  {"nbody",         NULL, "tests/nbody.c",         1},
+  {"spectral_norm", NULL, "tests/spectral_norm.c", 1},
+  {"pi_digits",     NULL, "tests/pi_digits.c",     1},
+  {"expr_eval",     NULL, "tests/expr_eval.c",     1},
+  {"sort",          NULL, "tests/sort.c",           1},
 };
 
 #define N_BENCH (sizeof (benchmarks) / sizeof (benchmarks[0]))
@@ -331,45 +403,57 @@ static struct bench_result best_of (struct bench_result *runs, int n) {
 #define N_RUNS 5
 
 int main (void) {
-  printf ("%-16s %14s %14s %14s %14s %14s %14s %14s %8s\n",
-          "Benchmark", "sljit compile", "sljit-O1 comp", "mir compile",
-          "sljit exec", "sljit-O1 exec", "mir exec", "sljit/mir", "result");
-  printf ("%-16s %14s %14s %14s %14s %14s %14s %14s %8s\n",
-          "----------------", "--------------", "--------------", "--------------",
-          "--------------", "--------------", "--------------",
-          "--------------", "--------");
+  /* Header */
+  printf ("%-16s  ----------- compile (us) -----------   ------------ execute (us) ------------\n", "");
+  printf ("%-16s  %6s %6s %6s %6s %6s %6s   %6s %6s %6s %6s %6s %6s\n",
+          "Benchmark", "sljit", "slj-1", "mir", "mir-1", "mir-2", "mir-3",
+          "sljit", "slj-1", "mir", "mir-1", "mir-2", "mir-3");
+  printf ("%-16s  %6s %6s %6s %6s %6s %6s   %6s %6s %6s %6s %6s %6s\n",
+          "----------------",
+          "------", "------", "------", "------", "------", "------",
+          "------", "------", "------", "------", "------", "------");
 
   for (size_t i = 0; i < N_BENCH; i++) {
-    struct bench_result sljit_runs[N_RUNS], sljit_o1_runs[N_RUNS], mir_runs[N_RUNS];
+    const char *source = benchmarks[i].source;
+    char *file_buf = NULL;
+    if (source == NULL && benchmarks[i].file_path != NULL) {
+      file_buf = read_file (benchmarks[i].file_path);
+      if (file_buf == NULL) {
+        fprintf (stderr, "cannot read %s\n", benchmarks[i].file_path);
+        continue;
+      }
+      source = file_buf;
+    }
+
+    int has_out = benchmarks[i].has_output;
+
+    struct bench_result sr[N_RUNS], s1r[N_RUNS];
+    struct bench_result mr[N_RUNS], m1r[N_RUNS], m2r[N_RUNS], m3r[N_RUNS];
+
     for (int r = 0; r < N_RUNS; r++) {
-      sljit_runs[r] = run_c2sljit (benchmarks[i].name, benchmarks[i].source, 0);
-      sljit_o1_runs[r] = run_c2sljit (benchmarks[i].name, benchmarks[i].source, 1);
-      mir_runs[r] = run_c2mir (benchmarks[i].name, benchmarks[i].source);
-    }
-    struct bench_result sljit_r = best_of (sljit_runs, N_RUNS);
-    struct bench_result sljit_o1_r = best_of (sljit_o1_runs, N_RUNS);
-    struct bench_result mir_r = best_of (mir_runs, N_RUNS);
-
-    double exec_ratio = mir_r.exec_us > 0 ? sljit_o1_r.exec_us / mir_r.exec_us : 0;
-
-    const char *result_str;
-    char result_buf[64];
-    if (!sljit_o1_r.ok || !mir_r.ok) {
-      result_str = "FAIL";
-    } else if (sljit_o1_r.result != mir_r.result) {
-      snprintf (result_buf, sizeof (result_buf), "MISMATCH %d/%d",
-                sljit_o1_r.result, mir_r.result);
-      result_str = result_buf;
-    } else {
-      snprintf (result_buf, sizeof (result_buf), "%d", mir_r.result);
-      result_str = result_buf;
+      sr[r]  = run_c2sljit (benchmarks[i].name, source, 0, has_out);
+      s1r[r] = run_c2sljit (benchmarks[i].name, source, 1, has_out);
+      mr[r]  = run_c2mir (benchmarks[i].name, source, 0, has_out);
+      m1r[r] = run_c2mir (benchmarks[i].name, source, 1, has_out);
+      m2r[r] = run_c2mir (benchmarks[i].name, source, 2, has_out);
+      m3r[r] = run_c2mir (benchmarks[i].name, source, 3, has_out);
     }
 
-    printf ("%-16s %11.0f us %11.0f us %11.0f us %11.0f us %11.0f us %11.0f us %7.2fx %8s\n",
+    struct bench_result s  = best_of (sr,  N_RUNS);
+    struct bench_result s1 = best_of (s1r, N_RUNS);
+    struct bench_result m  = best_of (mr,  N_RUNS);
+    struct bench_result m1 = best_of (m1r, N_RUNS);
+    struct bench_result m2 = best_of (m2r, N_RUNS);
+    struct bench_result m3 = best_of (m3r, N_RUNS);
+
+    printf ("%-16s  %6.0f %6.0f %6.0f %6.0f %6.0f %6.0f   %6.0f %6.0f %6.0f %6.0f %6.0f %6.0f\n",
             benchmarks[i].name,
-            sljit_r.compile_us, sljit_o1_r.compile_us, mir_r.compile_us,
-            sljit_r.exec_us, sljit_o1_r.exec_us, mir_r.exec_us, exec_ratio,
-            result_str);
+            s.compile_us, s1.compile_us,
+            m.compile_us, m1.compile_us, m2.compile_us, m3.compile_us,
+            s.exec_us, s1.exec_us,
+            m.exec_us, m1.exec_us, m2.exec_us, m3.exec_us);
+
+    free (file_buf);
   }
 
   return 0;

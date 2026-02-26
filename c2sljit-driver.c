@@ -51,6 +51,12 @@ static void usage (const char *prog) {
            "  -fopt-commute        Commutative operand swap\n"
            "  -fopt-smart-regs     Cache-aware temp reg allocation\n"
            "  -fopt-defer-store    Deferred write-back\n"
+           "  -fopt-float-promote  Float register promotion\n"
+           "  -fopt-float-cache    Float register caching\n"
+           "  -fopt-float-chain    Float expression spill elimination\n"
+           "  -fopt-addr-cache     Address register caching\n"
+           "  -fopt-fmadd          Fused multiply-add (ARM64)\n"
+           "  -fopt-float-field-cache  Float field load CSE\n"
            "  -h           Show this help\n",
            prog);
 }
@@ -97,11 +103,34 @@ int main (int argc, char *argv[]) {
       opts.opt_smart_regs_p = 1;
     } else if (strcmp (argv[i], "-fopt-defer-store") == 0) {
       opts.opt_defer_store_p = 1;
+    } else if (strcmp (argv[i], "-fopt-float-promote") == 0) {
+      opts.opt_float_promote_p = 1;
+    } else if (strcmp (argv[i], "-fopt-float-cache") == 0) {
+      opts.opt_float_cache_p = 1;
+    } else if (strcmp (argv[i], "-fopt-ind-cache") == 0) {
+      opts.opt_ind_cache_p = 1;
+    } else if (strcmp (argv[i], "-fopt-inline") == 0) {
+      opts.opt_inline_p = 1;
+    } else if (strcmp (argv[i], "-fopt-float-chain") == 0) {
+      opts.opt_float_chain_p = 1;
+    } else if (strcmp (argv[i], "-fopt-addr-cache") == 0) {
+      opts.opt_addr_cache_p = 1;
+    } else if (strcmp (argv[i], "-fopt-fmadd") == 0) {
+      opts.opt_fmadd_p = 1;
+    } else if (strcmp (argv[i], "-fopt-float-field-cache") == 0) {
+      opts.opt_float_field_cache_p = 1;
     } else if (strcmp (argv[i], "-O1") == 0) {
       opts.opt_mem_operands_p = 1;
       opts.opt_reg_cache_p = opts.opt_cmp_branch_p = 1;
       opts.opt_strength_reduce_p = opts.opt_commute_p = 1;
       opts.opt_smart_regs_p = opts.opt_defer_store_p = 1;
+      opts.opt_float_promote_p = opts.opt_float_cache_p = 1;
+      opts.opt_ind_cache_p = opts.opt_inline_p = 1;
+      opts.opt_float_chain_p = opts.opt_addr_cache_p = 1;
+      opts.opt_float_field_cache_p = 1;
+#if defined(__aarch64__) || defined(_M_ARM64)
+      opts.opt_fmadd_p = 1;
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
       opts.opt_magic_div_p = 1;
 #endif

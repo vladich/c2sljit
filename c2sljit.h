@@ -28,6 +28,14 @@ struct c2sljit_options {
   int opt_commute_p;         /* Opt 7: commutative operand swap */
   int opt_smart_regs_p;      /* Opt 8: cache-aware temp reg allocation */
   int opt_defer_store_p;     /* Opt 9: deferred write-back for cached vars */
+  int opt_float_promote_p;   /* Opt 10: float register promotion to FS saved regs */
+  int opt_float_cache_p;     /* Opt 11: float register caching in basic blocks */
+  int opt_ind_cache_p;       /* Opt 12: array index address caching */
+  int opt_inline_p;          /* Opt 13: small function inlining */
+  int opt_float_chain_p;     /* Opt 14: float expression spill elimination */
+  int opt_addr_cache_p;      /* Opt 15: address register caching */
+  int opt_fmadd_p;           /* Opt 16: fused multiply-add (ARM64) */
+  int opt_float_field_cache_p; /* Opt 17: float field load CSE */
   size_t module_num;
   FILE *prepro_output_file; /* non-null for prepro_only_p */
   const char *output_file_name;
