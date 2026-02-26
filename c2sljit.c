@@ -22,6 +22,7 @@
 #include <setjmp.h>
 #include <math.h>
 #include <wchar.h>
+#include <dlfcn.h>
 #include "mir-alloc.h"
 #include "mir-compat.h"
 #include "time.h"
@@ -10116,10 +10117,10 @@ static const MIR_type_t MIR_UNUSED MIR_POINTER_TYPE = MIR_T_I32;
 /* ---- Operand representation for sljit code gen ---- */
 
 typedef enum {
-  OPK_REG,     /* value in an sljit register */
+  OPK_REG,     /* value in an sljit integer register */
   OPK_IMM,     /* integer immediate */
   OPK_MEM,     /* memory: base_reg + offset */
-  OPK_FIMM,    /* float immediate (TODO) */
+  OPK_FREG,    /* value in an sljit float register */
   OPK_NONE,    /* no value / void */
 } op_kind_t;
 
@@ -10145,12 +10146,24 @@ typedef struct compiled_func {
 
 DEF_VARR (compiled_func_t);
 
+/* ---- Function slot for indirect calls (supports forward/recursive references) ---- */
+
+#define MAX_FUNC_SLOTS 256
+
+struct func_slot {
+  const char *name;
+  void *code_addr; /* filled after sljit_generate_code */
+};
+
 /* ---- gen_ctx: code generation state ---- */
 
 struct gen_ctx {
   struct sljit_compiler *compiler;  /* current function's compiler */
   VARR (compiled_func_t) *compiled_funcs;
   int next_temp_reg;  /* next scratch register to allocate (R0..R5) */
+  int next_float_reg; /* next float scratch register to allocate (FR0..FR5) */
+  int func_returns_float; /* 1 if current function returns float/double */
+  int func_returns_f32;   /* 1 if current function returns float (not double) */
   /* Labels for loop control flow */
   struct sljit_label *continue_label;
   struct sljit_jump *break_jump_head;
@@ -10158,6 +10171,10 @@ struct gen_ctx {
   struct sljit_jump **break_jumps;
   int break_jump_count;
   int break_jump_cap;
+  /* Deferred continue jumps (for inverted loops where continue_label is emitted after body) */
+  struct sljit_jump **continue_jumps;
+  int continue_jump_count;
+  int continue_jump_cap;
   /* Function-level info */
   sljit_sw local_size;    /* bytes allocated for local vars on stack */
   int in_function;        /* are we inside a function? */
@@ -10183,6 +10200,33 @@ struct gen_ctx {
   } reg_cache[REG_CACHE_SIZE];
   int reg_cache_count;
   sljit_s32 assign_dest;  /* target saved reg for destination-directed emit, or 0 */
+  sljit_sw call_save_offset; /* stack offset for saving call arguments */
+  int call_arg_slots;         /* number of arg slots allocated (4 or 10) */
+  sljit_sw call_ret_base;   /* stack offset for saving call return values */
+  int call_ret_slot;        /* next available return value save slot */
+  /* Persistent data buffer for string literals and global variables */
+  char *data_buf;
+  sljit_sw data_buf_size;
+  sljit_sw data_buf_used;
+  /* Global variable table */
+#define MAX_GLOBALS 256
+  struct global_var {
+    decl_t decl;
+    void *addr;
+  } globals[MAX_GLOBALS];
+  int n_globals;
+  /* Function slots for indirect calls (supports forward/recursive refs) */
+  struct func_slot func_slots[MAX_FUNC_SLOTS];
+  int n_func_slots;
+  /* Label table for goto support */
+#define MAX_LABELS 64
+  struct label_entry {
+    node_t target;            /* N_LABEL AST node (used as key) */
+    struct sljit_label *label; /* sljit label, set when N_LABEL is emitted */
+    struct sljit_jump *pending[8]; /* forward gotos waiting to be patched */
+    int n_pending;
+  } labels[MAX_LABELS];
+  int n_labels;
 };
 
 /* Accessor macros (gen_ctx is a local variable in each function, not a macro) */
@@ -10196,8 +10240,68 @@ static int sljit_type_size (struct type *type) {
   return sizeof (sljit_sw);  /* default to pointer size */
 }
 
-/* ---- Opt 4: forward declarations ---- */
+/* ---- Forward declarations ---- */
 static void invalidate_reg_in_cache (c2m_ctx_t c2m_ctx, sljit_s32 reg);
+static void *find_compiled_func (c2m_ctx_t c2m_ctx, const char *name);
+static int node_has_ops (node_code_t code);
+
+/* ---- Data buffer helpers ---- */
+
+static void *data_alloc (c2m_ctx_t c2m_ctx, sljit_sw size, int align) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  /* Align */
+  sljit_sw offset = (gen_ctx->data_buf_used + align - 1) & ~(align - 1);
+  sljit_sw needed = offset + size;
+  if (needed > gen_ctx->data_buf_size) {
+    sljit_sw new_size = gen_ctx->data_buf_size == 0 ? 4096 : gen_ctx->data_buf_size * 2;
+    while (new_size < needed) new_size *= 2;
+    gen_ctx->data_buf = realloc (gen_ctx->data_buf, new_size);
+    gen_ctx->data_buf_size = new_size;
+  }
+  void *ptr = gen_ctx->data_buf + offset;
+  gen_ctx->data_buf_used = offset + size;
+  return ptr;
+}
+
+/* ---- Function slot helpers ---- */
+
+static struct func_slot *find_func_slot (c2m_ctx_t c2m_ctx, const char *name) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  for (int i = 0; i < gen_ctx->n_func_slots; i++) {
+    if (strcmp (gen_ctx->func_slots[i].name, name) == 0) return &gen_ctx->func_slots[i];
+  }
+  return NULL;
+}
+
+static struct func_slot *add_func_slot (c2m_ctx_t c2m_ctx, const char *name) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  if (gen_ctx->n_func_slots >= MAX_FUNC_SLOTS) return NULL;
+  struct func_slot *s = &gen_ctx->func_slots[gen_ctx->n_func_slots++];
+  s->name = name;
+  s->code_addr = NULL;
+  return s;
+}
+
+/* ---- Label table helpers for goto support ---- */
+
+static struct label_entry *find_label (c2m_ctx_t c2m_ctx, node_t target) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  for (int i = 0; i < gen_ctx->n_labels; i++)
+    if (gen_ctx->labels[i].target == target) return &gen_ctx->labels[i];
+  return NULL;
+}
+
+static struct label_entry *get_or_add_label (c2m_ctx_t c2m_ctx, node_t target) {
+  struct label_entry *le = find_label (c2m_ctx, target);
+  if (le != NULL) return le;
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  if (gen_ctx->n_labels >= MAX_LABELS) return NULL;
+  le = &gen_ctx->labels[gen_ctx->n_labels++];
+  le->target = target;
+  le->label = NULL;
+  le->n_pending = 0;
+  return le;
+}
 
 /* Opt 8: check if a register is currently in the cache.  Returns cache index or -1. */
 static int find_reg_in_cache (c2m_ctx_t c2m_ctx, sljit_s32 reg) {
@@ -10244,6 +10348,7 @@ static sljit_s32 get_temp_reg (c2m_ctx_t c2m_ctx) {
 static void reset_temp_regs (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   gen_ctx->next_temp_reg = 0;
+  gen_ctx->next_float_reg = 0;
 }
 
 /* ---- Opt 4: Register cache functions ---- */
@@ -10276,9 +10381,17 @@ static sljit_s32 find_cached_reg (c2m_ctx_t c2m_ctx, decl_t decl) {
   return -1;
 }
 
+static int is_global_decl (c2m_ctx_t c2m_ctx, decl_t decl) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  for (int i = 0; i < gen_ctx->n_globals; i++)
+    if (gen_ctx->globals[i].decl == decl) return 1;
+  return 0;
+}
+
 static void cache_reg (c2m_ctx_t c2m_ctx, decl_t decl, sljit_s32 reg) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   if (!c2m_options->opt_reg_cache_p || decl == NULL || decl->addr_p) return;
+  if (is_global_decl (c2m_ctx, decl)) return; /* globals use absolute addresses */
   /* Update existing entry */
   for (int i = 0; i < gen_ctx->reg_cache_count; i++) {
     if (gen_ctx->reg_cache[i].decl == decl) {
@@ -10314,6 +10427,7 @@ static void cache_reg (c2m_ctx_t c2m_ctx, decl_t decl, sljit_s32 reg) {
 static void cache_reg_dirty (c2m_ctx_t c2m_ctx, decl_t decl, sljit_s32 reg, sljit_sw offset) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   if (!c2m_options->opt_reg_cache_p || decl == NULL || decl->addr_p) return;
+  if (is_global_decl (c2m_ctx, decl)) return; /* globals use absolute addresses */
   /* Update existing entry */
   for (int i = 0; i < gen_ctx->reg_cache_count; i++) {
     if (gen_ctx->reg_cache[i].decl == decl) {
@@ -10385,11 +10499,25 @@ static op_t force_reg (c2m_ctx_t c2m_ctx, op_t op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   sljit_s32 dst;
   if (op.kind == OPK_REG) return op;
+  if (op.kind == OPK_FREG) {
+    /* Convert float to integer (truncation) */
+    dst = get_temp_reg (c2m_ctx);
+    sljit_emit_fop1 (compiler, SLJIT_CONV_SW_FROM_F64, dst, 0, op.reg, 0);
+    op.kind = OPK_REG;
+    op.reg = dst;
+    return op;
+  }
   dst = get_temp_reg (c2m_ctx);
   if (op.kind == OPK_IMM) {
     sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_IMM, op.imm);
   } else if (op.kind == OPK_MEM) {
-    sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_MEM1 (op.base), op.imm);
+    if (op.base == 0) {
+      /* Absolute address (global variable) — load via address register */
+      sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_IMM, op.imm);
+      sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_MEM1 (dst), 0);
+    } else {
+      sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_MEM1 (op.base), op.imm);
+    }
   }
   op.kind = OPK_REG;
   op.reg = dst;
@@ -10422,7 +10550,14 @@ static void store_to_mem (c2m_ctx_t c2m_ctx, op_t dst, op_t val, int size) {
   case 4: mov_op = SLJIT_MOV_U32; break;
   default: mov_op = SLJIT_MOV; break;
   }
-  sljit_emit_op1 (compiler, mov_op, SLJIT_MEM1 (dst.base), dst.imm, v.reg, 0);
+  if (dst.base == 0) {
+    /* Absolute address (global variable) */
+    sljit_s32 addr_reg = get_temp_reg (c2m_ctx);
+    sljit_emit_op1 (compiler, SLJIT_MOV, addr_reg, 0, SLJIT_IMM, dst.imm);
+    sljit_emit_op1 (compiler, mov_op, SLJIT_MEM1 (addr_reg), 0, v.reg, 0);
+  } else {
+    sljit_emit_op1 (compiler, mov_op, SLJIT_MEM1 (dst.base), dst.imm, v.reg, 0);
+  }
 }
 
 /* ---- Load from memory ---- */
@@ -10443,8 +10578,118 @@ static op_t load_from_mem (c2m_ctx_t c2m_ctx, op_t src, int size, int is_signed)
   case 4: mov_op = is_signed ? SLJIT_MOV_S32 : SLJIT_MOV_U32; break;
   default: mov_op = SLJIT_MOV; break;
   }
-  sljit_emit_op1 (compiler, mov_op, dst, 0, SLJIT_MEM1 (src.base), src.imm);
+  if (src.base == 0) {
+    /* Absolute address (global variable) — load via address register */
+    sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_IMM, src.imm);
+    sljit_emit_op1 (compiler, mov_op, dst, 0, SLJIT_MEM1 (dst), 0);
+  } else {
+    sljit_emit_op1 (compiler, mov_op, dst, 0, SLJIT_MEM1 (src.base), src.imm);
+  }
   return (op_t){.decl = src.decl, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
+}
+
+/* ---- Float type detection ---- */
+
+static int is_float_type (struct type *type) {
+  return type != NULL && type->mode == TM_BASIC
+         && (type->u.basic_type == TP_FLOAT || type->u.basic_type == TP_DOUBLE
+             || type->u.basic_type == TP_LDOUBLE);
+}
+
+static int is_f32_type (struct type *type) {
+  return type != NULL && type->mode == TM_BASIC && type->u.basic_type == TP_FLOAT;
+}
+
+/* Map C type to sljit arg type for function signatures */
+static sljit_s32 sljit_arg_type_for (struct type *type) {
+  if (type == NULL) return SLJIT_ARG_TYPE_W;
+  if (is_f32_type (type)) return SLJIT_ARG_TYPE_F32;
+  if (is_float_type (type)) return SLJIT_ARG_TYPE_F64;
+  return SLJIT_ARG_TYPE_W;
+}
+
+/* Build sljit arg_types from return type + up to 4 param types */
+static sljit_s32 build_arg_types (struct type *ret_type, struct type **param_types, int nparams) {
+  sljit_s32 at = (ret_type != NULL && ret_type->mode == TM_BASIC && ret_type->u.basic_type == TP_VOID)
+                   ? SLJIT_ARG_TYPE_RET_VOID
+                   : sljit_arg_type_for (ret_type);
+  for (int i = 0; i < nparams && i < 4; i++)
+    at |= (sljit_arg_type_for (param_types[i]) << (SLJIT_ARG_SHIFT * (i + 1)));
+  return at;
+}
+
+/* ---- Float register allocation ---- */
+
+#define N_FLOAT_TEMP_REGS 6  /* FR0..FR5 */
+
+static sljit_s32 get_float_temp_reg (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  sljit_s32 reg = SLJIT_FR0 + (gen_ctx->next_float_reg % N_FLOAT_TEMP_REGS);
+  gen_ctx->next_float_reg++;
+  return reg;
+}
+
+/* ---- Float load from memory ---- */
+
+static op_t load_float_from_mem (c2m_ctx_t c2m_ctx, op_t src, int is_f32) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  sljit_s32 dst = get_float_temp_reg (c2m_ctx);
+  sljit_s32 mov_op = is_f32 ? SLJIT_MOV_F32 : SLJIT_MOV_F64;
+  if (src.kind == OPK_FREG) {
+    sljit_emit_fop1 (compiler, mov_op, dst, 0, src.reg, 0);
+    return (op_t){.decl = src.decl, .kind = OPK_FREG, .reg = dst, .imm = 0, .base = 0};
+  }
+  assert (src.kind == OPK_MEM);
+  if (src.base == 0) {
+    sljit_s32 addr_reg = get_temp_reg (c2m_ctx);
+    sljit_emit_op1 (compiler, SLJIT_MOV, addr_reg, 0, SLJIT_IMM, src.imm);
+    sljit_emit_fop1 (compiler, mov_op, dst, 0, SLJIT_MEM1 (addr_reg), 0);
+  } else {
+    sljit_emit_fop1 (compiler, mov_op, dst, 0, SLJIT_MEM1 (src.base), src.imm);
+  }
+  return (op_t){.decl = src.decl, .kind = OPK_FREG, .reg = dst, .imm = 0, .base = 0};
+}
+
+/* ---- Float store to memory ---- */
+
+static void store_float_to_mem (c2m_ctx_t c2m_ctx, op_t dst, op_t val, int is_f32) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  sljit_s32 mov_op = is_f32 ? SLJIT_MOV_F32 : SLJIT_MOV_F64;
+  assert (val.kind == OPK_FREG);
+  if (dst.kind == OPK_MEM) {
+    if (dst.base == 0) {
+      sljit_s32 addr_reg = get_temp_reg (c2m_ctx);
+      sljit_emit_op1 (compiler, SLJIT_MOV, addr_reg, 0, SLJIT_IMM, dst.imm);
+      sljit_emit_fop1 (compiler, mov_op, SLJIT_MEM1 (addr_reg), 0, val.reg, 0);
+    } else {
+      sljit_emit_fop1 (compiler, mov_op, SLJIT_MEM1 (dst.base), dst.imm, val.reg, 0);
+    }
+  }
+}
+
+/* ---- Force float value into a float register ---- */
+
+static op_t force_freg (c2m_ctx_t c2m_ctx, op_t op, int is_f32) {
+  if (op.kind == OPK_FREG) return op;
+  if (op.kind == OPK_MEM) return load_float_from_mem (c2m_ctx, op, is_f32);
+  /* OPK_REG (int) → convert to float */
+  if (op.kind == OPK_REG) {
+    gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+    sljit_s32 dst = get_float_temp_reg (c2m_ctx);
+    sljit_emit_fop1 (compiler, is_f32 ? SLJIT_CONV_F32_FROM_SW : SLJIT_CONV_F64_FROM_SW, dst, 0,
+                     op.reg, 0);
+    return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = dst, .imm = 0, .base = 0};
+  }
+  if (op.kind == OPK_IMM) {
+    gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+    sljit_s32 dst = get_float_temp_reg (c2m_ctx);
+    if (is_f32)
+      sljit_emit_fset32 (compiler, dst, (float) op.imm);
+    else
+      sljit_emit_fset64 (compiler, dst, (double) op.imm);
+    return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = dst, .imm = 0, .base = 0};
+  }
+  return op;
 }
 
 /* ---- Variable lookup: returns OPK_REG or OPK_MEM operand for a local variable ---- */
@@ -10456,6 +10701,12 @@ static op_t var_op (c2m_ctx_t c2m_ctx, decl_t decl) {
     if (gen_ctx->reg_vars[i].decl == decl)
       return (op_t){.decl = decl, .kind = OPK_REG,
                      .reg = gen_ctx->reg_vars[i].reg, .imm = 0, .base = 0};
+  }
+  /* Check global variable table */
+  for (int i = 0; i < gen_ctx->n_globals; i++) {
+    if (gen_ctx->globals[i].decl == decl)
+      return (op_t){.decl = decl, .kind = OPK_MEM, .reg = 0,
+                     .imm = (sljit_sw) gen_ctx->globals[i].addr, .base = 0};
   }
   /* Local variables are at SLJIT_SP + offset (computed by context checker) */
   return (op_t){.decl = decl,
@@ -10521,6 +10772,41 @@ static int is_power_of_2 (sljit_sw val) {
   int log2 = 0;
   while ((1L << log2) != val) log2++;
   return log2;
+}
+
+/* Magic number for signed 32-bit division by constant d.
+   Computes multiplier M and shift S such that:
+   x / d ≈ ((int64_t)x * M) >> (32 + S) with sign correction.
+   Algorithm from Hacker's Delight, Chapter 10. */
+struct magic_signed {
+  int64_t magic; /* multiplier (fits in 33 bits of magnitude) */
+  int shift;     /* post-shift amount (added to 32) */
+};
+
+static struct magic_signed compute_signed_magic32 (int32_t d) {
+  int negative = (d < 0);
+  uint32_t ad = negative ? (uint32_t) (-(int64_t) d) : (uint32_t) d;
+  uint64_t two_p = (uint64_t) 1 << 31; /* 2^p, starts at 2^31 */
+  uint64_t anc = two_p - 1 - two_p % ad; /* |nc| */
+  int p = 31;
+  uint64_t q1 = two_p / anc;
+  uint64_t r1 = two_p - q1 * anc;
+  uint64_t q2 = two_p / ad;
+  uint64_t r2 = two_p - q2 * ad;
+  uint64_t delta;
+  do {
+    p++;
+    q1 = 2 * q1;
+    r1 = 2 * r1;
+    if (r1 >= anc) { q1++; r1 -= anc; }
+    q2 = 2 * q2;
+    r2 = 2 * r2;
+    if (r2 >= ad) { q2++; r2 -= ad; }
+    delta = ad - r2;
+  } while (q1 < delta || (q1 == delta && r1 == 0));
+  int64_t magic = (int64_t) (q2 + 1);
+  if (negative) magic = -magic;
+  return (struct magic_signed){.magic = magic, .shift = p - 32};
 }
 
 /* Emit optimized multiply by constant.  Returns OPK_NONE if not handled. */
@@ -10633,9 +10919,44 @@ static op_t emit_signed_mod_pow2 (c2m_ctx_t c2m_ctx, sljit_s32 src_reg, int log2
   return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
 }
 
+/* Emit signed div by non-power-of-2 constant using magic number multiplication.
+   For 32-bit: sign-extend to 64, multiply by magic (64-bit), ASHR by 32+S.
+   Returns OPK_NONE if not handled (e.g. 64-bit operands). */
+static op_t emit_signed_div_magic (c2m_ctx_t c2m_ctx, sljit_s32 src_reg, sljit_sw divisor, int op32) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  if (!op32) return (op_t){.decl = NULL, .kind = OPK_NONE, .reg = 0, .imm = 0, .base = 0};
+  struct magic_signed m = compute_signed_magic32 ((int32_t) divisor);
+  sljit_s32 dst = get_temp_reg (c2m_ctx);
+  sljit_s32 tmp = get_temp_reg (c2m_ctx);
+  /* Sign-extend src from 32-bit to 64-bit */
+  sljit_emit_op1 (compiler, SLJIT_MOV_S32, dst, 0, src_reg, 0);
+  /* 64-bit multiply: dst = (int64_t)src * magic */
+  sljit_emit_op2 (compiler, SLJIT_MUL, dst, 0, dst, 0, SLJIT_IMM, m.magic);
+  /* Arithmetic right-shift by 32+shift to get quotient */
+  sljit_emit_op2 (compiler, SLJIT_ASHR, dst, 0, dst, 0, SLJIT_IMM, 32 + m.shift);
+  /* Sign correction: add 1 if quotient is negative (round toward zero) */
+  sljit_emit_op2 (compiler, SLJIT_LSHR, tmp, 0, dst, 0, SLJIT_IMM, 63);
+  sljit_emit_op2 (compiler, SLJIT_ADD, dst, 0, dst, 0, tmp, 0);
+  return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
+}
+
+/* Emit signed mod by non-power-of-2 constant: mod = x - (x/d)*d using magic div. */
+static op_t emit_signed_mod_magic (c2m_ctx_t c2m_ctx, sljit_s32 src_reg, sljit_sw divisor, int op32) {
+  op_t q = emit_signed_div_magic (c2m_ctx, src_reg, divisor, op32);
+  if (q.kind == OPK_NONE) return q;
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  sljit_s32 dst = get_temp_reg (c2m_ctx);
+  /* dst = quotient * divisor */
+  sljit_emit_op2 (compiler, SLJIT_MUL | op32, dst, 0, q.reg, 0, SLJIT_IMM, divisor);
+  /* dst = src - dst (remainder) */
+  sljit_emit_op2 (compiler, SLJIT_SUB | op32, dst, 0, src_reg, 0, dst, 0);
+  return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
+}
+
 /* ---- Helper: set up R0/R1 for DIV/MOD avoiding clobber conflicts ---- */
 static void setup_divmod_regs (c2m_ctx_t c2m_ctx, sljit_s32 l_reg, sljit_s32 rv_reg) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  if (l_reg == SLJIT_R0 && rv_reg == SLJIT_R1) return; /* already in place */
   if (l_reg == SLJIT_R1 && rv_reg == SLJIT_R0) {
     /* Both crossed: need swap via temp */
     sljit_s32 tmp = get_temp_reg (c2m_ctx);
@@ -10647,16 +10968,76 @@ static void setup_divmod_regs (c2m_ctx_t c2m_ctx, sljit_s32 l_reg, sljit_s32 rv_
     sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R1, 0, rv_reg, 0);
     sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R0, 0, l_reg, 0);
   } else {
-    /* No conflict (or l in R1 but rv not in R0 — move l first) */
-    sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R0, 0, l_reg, 0);
-    sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R1, 0, rv_reg, 0);
+    if (l_reg != SLJIT_R0)
+      sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R0, 0, l_reg, 0);
+    if (rv_reg != SLJIT_R1)
+      sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R1, 0, rv_reg, 0);
   }
+}
+
+/* ---- Variadic call trampoline ---- */
+/* On ARM64, variadic calling convention requires variadic args on the stack,
+   but sljit's icall ignores arg_types and passes everything in registers.
+   This trampoline is compiled by the host C compiler, so it generates correct
+   ABI-compliant variadic calls. The JIT calls this as a normal 4-arg function.
+   All args (including floats) are passed as long — floats are bitcast to their
+   64-bit integer representation by the caller using sljit_emit_fcopy. */
+static long c2sljit_call_variadic (long fn, long n_fixed, long n_total, long *args) {
+  long a[10] = {0};
+  int nt = (int) n_total, nf = (int) n_fixed;
+  if (nt > 10) nt = 10;
+  for (int i = 0; i < nt; i++) a[i] = args[i];
+
+  switch (nf) {
+  case 1:
+    switch (nt) {
+    case 1: return ((long (*) (long)) fn) (a[0]);
+    case 2: return ((long (*) (long, ...)) fn) (a[0], a[1]);
+    case 3: return ((long (*) (long, ...)) fn) (a[0], a[1], a[2]);
+    case 4: return ((long (*) (long, ...)) fn) (a[0], a[1], a[2], a[3]);
+    case 5: return ((long (*) (long, ...)) fn) (a[0], a[1], a[2], a[3], a[4]);
+    case 6: return ((long (*) (long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 7: return ((long (*) (long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    case 8: return ((long (*) (long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+    case 9: return ((long (*) (long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+    case 10: return ((long (*) (long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]);
+    }
+    break;
+  case 2:
+    switch (nt) {
+    case 2: return ((long (*) (long, long)) fn) (a[0], a[1]);
+    case 3: return ((long (*) (long, long, ...)) fn) (a[0], a[1], a[2]);
+    case 4: return ((long (*) (long, long, ...)) fn) (a[0], a[1], a[2], a[3]);
+    case 5: return ((long (*) (long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4]);
+    case 6: return ((long (*) (long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 7: return ((long (*) (long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    case 8: return ((long (*) (long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+    case 9: return ((long (*) (long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+    case 10: return ((long (*) (long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]);
+    }
+    break;
+  case 3:
+    switch (nt) {
+    case 3: return ((long (*) (long, long, long)) fn) (a[0], a[1], a[2]);
+    case 4: return ((long (*) (long, long, long, ...)) fn) (a[0], a[1], a[2], a[3]);
+    case 5: return ((long (*) (long, long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4]);
+    case 6: return ((long (*) (long, long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 7: return ((long (*) (long, long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    case 8: return ((long (*) (long, long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+    case 9: return ((long (*) (long, long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+    case 10: return ((long (*) (long, long, long, ...)) fn) (a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]);
+    }
+    break;
+  }
+  return 0;
 }
 
 /* ---- Forward declarations ---- */
 
 static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p);
 static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r);
+static int scan_has_continue (node_t n);
+static void patch_continue_jumps (c2m_ctx_t c2m_ctx, struct sljit_label *label);
 
 /* Function-level variable promotion forward declarations */
 static int select_promotion_candidates (c2m_ctx_t c2m_ctx, node_t *nodes, int n_nodes,
@@ -10678,8 +11059,9 @@ static struct sljit_jump *emit_cond_branch (c2m_ctx_t c2m_ctx, node_t cond_node,
     node_t right = NL_NEXT (left);
     struct expr *left_e = left->attr;
     int cmp32 = (left_e && left_e->type && sljit_type_size (left_e->type) == 4) ? SLJIT_32 : 0;
-    op_t l = force_reg (c2m_ctx, gen (c2m_ctx, left, TRUE));
+    op_t l = gen (c2m_ctx, left, TRUE);
     op_t rv = gen_right_operand (c2m_ctx, right);
+    l = force_reg (c2m_ctx, l);
     sljit_s32 cond = comparison_cond (cond_node->code);
     if (invert) cond = invert_sljit_cond (cond);
     if (rv.kind == OPK_MEM)
@@ -10719,6 +11101,33 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
     return (op_t){
       .decl = NULL, .kind = OPK_IMM, .reg = 0, .imm = (sljit_sw) r->u.ch, .base = 0};
 
+  /* ---- String literal ---- */
+  case N_STR: {
+    /* Copy string bytes into persistent data buffer, return address as immediate */
+    size_t len = r->u.s.len;
+    char *dst = data_alloc (c2m_ctx, len, 1);
+    memcpy (dst, r->u.s.s, len);
+    return (op_t){.decl = NULL, .kind = OPK_IMM, .reg = 0, .imm = (sljit_sw) dst, .base = 0};
+  }
+
+  /* ---- Float/double constants ---- */
+  case N_F: {
+    sljit_s32 freg = get_float_temp_reg (c2m_ctx);
+    sljit_emit_fset32 (compiler, freg, r->u.f);
+    return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = freg, .imm = 0, .base = 0};
+  }
+  case N_D: {
+    sljit_s32 freg = get_float_temp_reg (c2m_ctx);
+    sljit_emit_fset64 (compiler, freg, r->u.d);
+    return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = freg, .imm = 0, .base = 0};
+  }
+  case N_LD: {
+    /* Treat long double as double (sljit only supports F32/F64) */
+    sljit_s32 freg = get_float_temp_reg (c2m_ctx);
+    sljit_emit_fset64 (compiler, freg, (double) r->u.ld);
+    return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = freg, .imm = 0, .base = 0};
+  }
+
   /* ---- Identifier reference ---- */
   case N_ID: {
     decl_t decl = e->u.lvalue_node != NULL ? e->u.lvalue_node->attr : NULL;
@@ -10727,7 +11136,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
       return void_op;
     }
     op_t v = var_op (c2m_ctx, decl);
+    /* Array decay: return address of the first element (arrays aren't loadable values) */
+    if (val_p && decl->decl_spec.type != NULL && decl->decl_spec.type->mode == TM_ARR) {
+      sljit_s32 dst = get_temp_reg (c2m_ctx);
+      if (v.kind == OPK_MEM && v.base == 0) {
+        sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_IMM, v.imm);
+      } else if (v.kind == OPK_MEM) {
+        sljit_get_local_base (compiler, dst, 0, v.imm);
+      } else {
+        return v;
+      }
+      return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
+    }
     if (val_p && type != NULL) {
+      /* Float variable: load using float move */
+      if (is_float_type (type) && v.kind == OPK_MEM) {
+        return load_float_from_mem (c2m_ctx, v, is_f32_type (type));
+      }
       /* Promoted variable: already in a saved register, return directly */
       if (v.kind == OPK_REG) return v;
       /* Opt 4: check register cache before loading from memory */
@@ -10755,6 +11180,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
   /* ---- Unary minus ---- */
   case N_SUB:
     if (NL_NEXT (NL_HEAD (r->u.ops)) == NULL) {
+      if (is_float_type (type)) {
+        int f32 = is_f32_type (type);
+        op_t operand = force_freg (c2m_ctx, gen (c2m_ctx, NL_HEAD (r->u.ops), TRUE), f32);
+        sljit_s32 dst = get_float_temp_reg (c2m_ctx);
+        sljit_emit_fop1 (compiler, f32 ? SLJIT_NEG_F32 : SLJIT_NEG_F64, dst, 0, operand.reg, 0);
+        return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = dst, .imm = 0, .base = 0};
+      }
       /* Unary minus: -expr */
       int op32 = (type != NULL && sljit_type_size (type) == 4) ? SLJIT_32 : 0;
       op_t operand = force_reg (c2m_ctx, gen (c2m_ctx, NL_HEAD (r->u.ops), TRUE));
@@ -10776,6 +11208,28 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
   case N_LSH:
   case N_RSH:
   binary_arith : {
+    /* Float arithmetic path */
+    if (is_float_type (type)) {
+      int f32 = is_f32_type (type);
+      sljit_s32 saved_dest = gen_ctx->assign_dest;
+      gen_ctx->assign_dest = 0;
+      node_t left = NL_HEAD (r->u.ops);
+      node_t right = NL_NEXT (left);
+      op_t l = force_freg (c2m_ctx, gen (c2m_ctx, left, TRUE), f32);
+      op_t rv = force_freg (c2m_ctx, gen (c2m_ctx, right, TRUE), f32);
+      sljit_s32 dst = get_float_temp_reg (c2m_ctx);
+      sljit_s32 fop;
+      switch (r->code) {
+      case N_ADD: fop = f32 ? SLJIT_ADD_F32 : SLJIT_ADD_F64; break;
+      case N_SUB: fop = f32 ? SLJIT_SUB_F32 : SLJIT_SUB_F64; break;
+      case N_MUL: fop = f32 ? SLJIT_MUL_F32 : SLJIT_MUL_F64; break;
+      case N_DIV: fop = f32 ? SLJIT_DIV_F32 : SLJIT_DIV_F64; break;
+      default: fop = f32 ? SLJIT_ADD_F32 : SLJIT_ADD_F64; break;
+      }
+      sljit_emit_fop2 (compiler, fop, dst, 0, l.reg, 0, rv.reg, 0);
+      gen_ctx->assign_dest = saved_dest;
+      return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = dst, .imm = 0, .base = 0};
+    }
     int op32 = (type != NULL && sljit_type_size (type) == 4) ? SLJIT_32 : 0;
     sljit_s32 saved_dest = gen_ctx->assign_dest;
     gen_ctx->assign_dest = 0;  /* clear so inner ops don't see it */
@@ -10788,9 +11242,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
     }
     /* For DIV/MOD, hint left operand to land in R0 (DIVMOD convention) */
     if (r->code == N_DIV || r->code == N_MOD) gen_ctx->assign_dest = SLJIT_R0;
-    op_t l = force_reg (c2m_ctx, gen (c2m_ctx, left, TRUE));
+    op_t l = gen (c2m_ctx, left, TRUE);
     if (r->code == N_DIV || r->code == N_MOD) gen_ctx->assign_dest = 0;
-    sljit_s32 dst = saved_dest ? saved_dest : get_temp_reg (c2m_ctx);
     sljit_s32 sljit_op;
     int use_mem_opt = (r->code == N_ADD || r->code == N_SUB || r->code == N_MUL
                        || r->code == N_AND || r->code == N_OR || r->code == N_XOR
@@ -10798,6 +11251,61 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
                        || r->code == N_DIV || r->code == N_MOD);
     op_t rv = use_mem_opt ? gen_right_operand (c2m_ctx, right)
                           : force_reg (c2m_ctx, gen (c2m_ctx, right, TRUE));
+    /* Defer force_reg of left until after right is evaluated (protects against call clobber) */
+    l = force_reg (c2m_ctx, l);
+    /* Pointer arithmetic: scale integer operand by element size */
+    if ((r->code == N_ADD || r->code == N_SUB) && type != NULL && type->mode == TM_PTR) {
+      mir_size_t elem_size
+        = (type->u.ptr_type->mode == TM_FUNC) ? 1 : type_size (c2m_ctx, type->u.ptr_type);
+      if (elem_size > 1) {
+        /* Determine which operand is the integer (the one to scale) */
+        struct expr *left_e = left->attr;
+        struct type *left_type = left_e != NULL ? left_e->type : NULL;
+        int left_is_ptr = left_type != NULL
+                          && (left_type->mode == TM_PTR || left_type->mode == TM_ARR);
+        if (left_is_ptr) {
+          /* Right is the integer — scale rv into a temp reg */
+          rv = force_reg (c2m_ctx, rv);
+          sljit_s32 scaled = get_temp_reg (c2m_ctx);
+          sljit_emit_op2 (compiler, SLJIT_MUL, scaled, 0, rv.reg, 0, SLJIT_IMM,
+                          (sljit_sw) elem_size);
+          rv = (op_t){.decl = NULL, .kind = OPK_REG, .reg = scaled, .imm = 0, .base = 0};
+        } else {
+          /* Left is the integer — scale l into a temp reg */
+          sljit_s32 scaled = get_temp_reg (c2m_ctx);
+          sljit_emit_op2 (compiler, SLJIT_MUL, scaled, 0, l.reg, 0, SLJIT_IMM,
+                          (sljit_sw) elem_size);
+          l = (op_t){.decl = NULL, .kind = OPK_REG, .reg = scaled, .imm = 0, .base = 0};
+        }
+      }
+      op32 = 0; /* pointer arithmetic is always pointer-width */
+    }
+    /* Pointer difference: ptr - ptr → divide by element size */
+    if (r->code == N_SUB && type != NULL && type->mode != TM_PTR) {
+      struct expr *left_e = left->attr;
+      struct expr *right_e = right->attr;
+      struct type *left_type = left_e != NULL ? left_e->type : NULL;
+      struct type *right_type = right_e != NULL ? right_e->type : NULL;
+      if (left_type != NULL && left_type->mode == TM_PTR && right_type != NULL
+          && right_type->mode == TM_PTR) {
+        mir_size_t elem_size
+          = (left_type->u.ptr_type->mode == TM_FUNC)
+              ? 1
+              : type_size (c2m_ctx, left_type->u.ptr_type);
+        if (elem_size > 1) {
+          /* Subtract first, then divide by element size */
+          rv = force_reg (c2m_ctx, rv);
+          sljit_s32 diff_reg = saved_dest ? saved_dest : get_temp_reg (c2m_ctx);
+          sljit_emit_op2 (compiler, SLJIT_SUB, diff_reg, 0, l.reg, 0, rv.reg, 0);
+          sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R0, 0, diff_reg, 0);
+          sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw) elem_size);
+          sljit_emit_op0 (compiler, SLJIT_DIV_SW);
+          sljit_emit_op1 (compiler, SLJIT_MOV, diff_reg, 0, SLJIT_R0, 0);
+          return (op_t){.decl = NULL, .kind = OPK_REG, .reg = diff_reg, .imm = 0, .base = 0};
+        }
+      }
+    }
+    sljit_s32 dst = saved_dest ? saved_dest : get_temp_reg (c2m_ctx);
     switch (r->code) {
     case N_ADD: sljit_op = SLJIT_ADD; break;
     case N_SUB: sljit_op = SLJIT_SUB; break;
@@ -10832,6 +11340,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
           return sr;
         }
       }
+      /* Opt 6b: magic number division for non-power-of-2 constants */
+      if (c2m_options->opt_magic_div_p && rv.kind == OPK_IMM && rv.imm > 1) {
+        op_t sr = emit_signed_div_magic (c2m_ctx, l.reg, rv.imm, op32);
+        if (sr.kind != OPK_NONE) {
+          if (saved_dest && sr.reg != saved_dest) {
+            sljit_emit_op1 (compiler, SLJIT_MOV, saved_dest, 0, sr.reg, 0);
+            sr.reg = saved_dest;
+          }
+          return sr;
+        }
+      }
       if (rv.kind == OPK_IMM) {
         if (l.reg != SLJIT_R0) sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R0, 0, l.reg, 0);
         sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, rv.imm);
@@ -10849,6 +11368,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
         int log2 = is_power_of_2 (rv.imm);
         if (log2 >= 0) {
           op_t sr = emit_signed_mod_pow2 (c2m_ctx, l.reg, log2, op32);
+          if (saved_dest && sr.reg != saved_dest) {
+            sljit_emit_op1 (compiler, SLJIT_MOV, saved_dest, 0, sr.reg, 0);
+            sr.reg = saved_dest;
+          }
+          return sr;
+        }
+      }
+      /* Opt 6b: magic number modulo for non-power-of-2 constants */
+      if (c2m_options->opt_magic_div_p && rv.kind == OPK_IMM && rv.imm > 1) {
+        op_t sr = emit_signed_mod_magic (c2m_ctx, l.reg, rv.imm, op32);
+        if (sr.kind != OPK_NONE) {
           if (saved_dest && sr.reg != saved_dest) {
             sljit_emit_op1 (compiler, SLJIT_MOV, saved_dest, 0, sr.reg, 0);
             sr.reg = saved_dest;
@@ -10908,11 +11438,33 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
   case N_GE: {
     node_t left = NL_HEAD (r->u.ops);
     node_t right = NL_NEXT (left);
-    /* Compute cmp32 from left operand's type */
+    /* Float comparison path */
     struct expr *left_e = left->attr;
+    if (left_e != NULL && left_e->type != NULL && is_float_type (left_e->type)) {
+      int f32 = is_f32_type (left_e->type);
+      op_t l = force_freg (c2m_ctx, gen (c2m_ctx, left, TRUE), f32);
+      op_t rv = force_freg (c2m_ctx, gen (c2m_ctx, right, TRUE), f32);
+      sljit_s32 fcond, set_flag;
+      switch (r->code) {
+      case N_EQ: fcond = SLJIT_F_EQUAL; set_flag = SLJIT_SET_F_EQUAL; break;
+      case N_NE: fcond = SLJIT_F_NOT_EQUAL; set_flag = SLJIT_SET_F_NOT_EQUAL; break;
+      case N_LT: fcond = SLJIT_F_LESS; set_flag = SLJIT_SET_F_LESS; break;
+      case N_LE: fcond = SLJIT_F_LESS_EQUAL; set_flag = SLJIT_SET_F_LESS_EQUAL; break;
+      case N_GT: fcond = SLJIT_F_GREATER; set_flag = SLJIT_SET_F_GREATER; break;
+      case N_GE: fcond = SLJIT_F_GREATER_EQUAL; set_flag = SLJIT_SET_F_GREATER_EQUAL; break;
+      default: fcond = SLJIT_F_EQUAL; set_flag = SLJIT_SET_F_EQUAL; break;
+      }
+      sljit_emit_fop1 (compiler, (f32 ? SLJIT_CMP_F32 : SLJIT_CMP_F64) | set_flag,
+                        l.reg, 0, rv.reg, 0);
+      sljit_s32 dst = get_temp_reg (c2m_ctx);
+      sljit_emit_op_flags (compiler, SLJIT_MOV, dst, 0, fcond);
+      return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
+    }
+    /* Integer comparison path */
     int cmp32 = (left_e && left_e->type && sljit_type_size (left_e->type) == 4) ? SLJIT_32 : 0;
-    op_t l = force_reg (c2m_ctx, gen (c2m_ctx, left, TRUE));
+    op_t l = gen (c2m_ctx, left, TRUE);
     op_t rv = gen_right_operand (c2m_ctx, right);
+    l = force_reg (c2m_ctx, l);
     sljit_s32 dst = get_temp_reg (c2m_ctx);
     sljit_s32 cond = comparison_cond (r->code);
 
@@ -10944,6 +11496,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
     node_t right = NL_NEXT (left);
     op_t dst_op = gen (c2m_ctx, left, FALSE);  /* lvalue */
     int size = type != NULL ? sljit_type_size (type) : (int) sizeof (sljit_sw);
+    /* Float assignment */
+    if (is_float_type (type)) {
+      int f32 = is_f32_type (type);
+      op_t val = force_freg (c2m_ctx, gen (c2m_ctx, right, TRUE), f32);
+      if (dst_op.kind == OPK_MEM)
+        store_float_to_mem (c2m_ctx, dst_op, val, f32);
+      return val;
+    }
     if (dst_op.kind == OPK_REG) {
       /* Destination-directed: set assign_dest so binary ops write directly */
       gen_ctx->assign_dest = dst_op.reg;
@@ -10990,9 +11550,32 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
   case N_XOR_ASSIGN:
   case N_LSH_ASSIGN:
   case N_RSH_ASSIGN: {
-    int op32 = (type != NULL && sljit_type_size (type) == 4) ? SLJIT_32 : 0;
     node_t left = NL_HEAD (r->u.ops);
     node_t right = NL_NEXT (left);
+
+    /* Float compound assignment (+=, -=, *=, /=) */
+    if (is_float_type (type)) {
+      int f32 = is_f32_type (type);
+      op_t dst_op = gen (c2m_ctx, left, FALSE);
+      invalidate_cached_var (c2m_ctx, dst_op.decl);
+      op_t cur = load_float_from_mem (c2m_ctx, dst_op, f32);
+      op_t rv = force_freg (c2m_ctx, gen (c2m_ctx, right, TRUE), f32);
+      sljit_s32 fop;
+      switch (r->code) {
+      case N_ADD_ASSIGN: fop = f32 ? SLJIT_ADD_F32 : SLJIT_ADD_F64; break;
+      case N_SUB_ASSIGN: fop = f32 ? SLJIT_SUB_F32 : SLJIT_SUB_F64; break;
+      case N_MUL_ASSIGN: fop = f32 ? SLJIT_MUL_F32 : SLJIT_MUL_F64; break;
+      case N_DIV_ASSIGN: fop = f32 ? SLJIT_DIV_F32 : SLJIT_DIV_F64; break;
+      default: fop = f32 ? SLJIT_ADD_F32 : SLJIT_ADD_F64; break;
+      }
+      sljit_s32 res_freg = get_float_temp_reg (c2m_ctx);
+      sljit_emit_fop2 (compiler, fop, res_freg, 0, cur.reg, 0, rv.reg, 0);
+      op_t result = {.decl = NULL, .kind = OPK_FREG, .reg = res_freg, .imm = 0, .base = 0};
+      store_float_to_mem (c2m_ctx, dst_op, result, f32);
+      return result;
+    }
+
+    int op32 = (type != NULL && sljit_type_size (type) == 4) ? SLJIT_32 : 0;
     op_t dst_op = gen (c2m_ctx, left, FALSE);  /* lvalue */
     invalidate_cached_var (c2m_ctx, dst_op.decl);
     int size = type != NULL ? sljit_type_size (type) : (int) sizeof (sljit_sw);
@@ -11005,6 +11588,20 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
                       || r->code == N_DIV_ASSIGN || r->code == N_MOD_ASSIGN);
     op_t rv = ca_use_mem ? gen_right_operand (c2m_ctx, right)
                          : force_reg (c2m_ctx, gen (c2m_ctx, right, TRUE));
+    /* Pointer arithmetic: scale RHS by element size for += and -= on pointers */
+    if ((r->code == N_ADD_ASSIGN || r->code == N_SUB_ASSIGN) && type != NULL
+        && type->mode == TM_PTR) {
+      mir_size_t elem_size
+        = (type->u.ptr_type->mode == TM_FUNC) ? 1 : type_size (c2m_ctx, type->u.ptr_type);
+      if (elem_size > 1) {
+        rv = force_reg (c2m_ctx, rv);
+        sljit_s32 scaled = get_temp_reg (c2m_ctx);
+        sljit_emit_op2 (compiler, SLJIT_MUL, scaled, 0, rv.reg, 0, SLJIT_IMM,
+                        (sljit_sw) elem_size);
+        rv = (op_t){.decl = NULL, .kind = OPK_REG, .reg = scaled, .imm = 0, .base = 0};
+      }
+      op32 = 0;
+    }
     /* For promoted vars, write directly to the saved reg */
     sljit_s32 res = (dst_op.kind == OPK_REG) ? dst_op.reg : get_temp_reg (c2m_ctx);
     sljit_s32 sljit_op;
@@ -11048,6 +11645,29 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
           op_t sr = (r->code == N_DIV_ASSIGN)
                       ? emit_signed_div_pow2 (c2m_ctx, cur.reg, log2, op32)
                       : emit_signed_mod_pow2 (c2m_ctx, cur.reg, log2, op32);
+          if (dst_op.kind == OPK_REG) {
+            if (sr.reg != dst_op.reg)
+              sljit_emit_op1 (compiler, SLJIT_MOV, dst_op.reg, 0, sr.reg, 0);
+            return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst_op.reg, .imm = 0, .base = 0};
+          }
+          if (c2m_options->opt_defer_store_p && c2m_options->opt_reg_cache_p
+              && dst_op.kind == OPK_MEM && dst_op.decl != NULL && !dst_op.decl->addr_p
+              && size >= (int) sizeof (sljit_sw)) {
+            cache_reg_dirty (c2m_ctx, dst_op.decl, sr.reg, dst_op.imm);
+          } else {
+            store_to_mem (c2m_ctx, dst_op, sr, size);
+            if (dst_op.kind == OPK_MEM && dst_op.decl != NULL && size >= (int) sizeof (sljit_sw))
+              cache_reg (c2m_ctx, dst_op.decl, sr.reg);
+          }
+          return sr;
+        }
+      }
+      /* Opt 6b: magic number div/mod-assign for non-power-of-2 constants */
+      if (c2m_options->opt_magic_div_p && rv.kind == OPK_IMM && rv.imm > 1) {
+        op_t sr = (r->code == N_DIV_ASSIGN)
+                    ? emit_signed_div_magic (c2m_ctx, cur.reg, rv.imm, op32)
+                    : emit_signed_mod_magic (c2m_ctx, cur.reg, rv.imm, op32);
+        if (sr.kind != OPK_NONE) {
           if (dst_op.kind == OPK_REG) {
             if (sr.reg != dst_op.reg)
               sljit_emit_op1 (compiler, SLJIT_MOV, dst_op.reg, 0, sr.reg, 0);
@@ -11117,6 +11737,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
   case N_INC:
   case N_DEC: {
     int op32 = (type != NULL && sljit_type_size (type) == 4) ? SLJIT_32 : 0;
+    sljit_sw step = 1;
+    if (type != NULL && type->mode == TM_PTR) {
+      step = (type->u.ptr_type->mode == TM_FUNC) ? 1 : (sljit_sw) type_size (c2m_ctx, type->u.ptr_type);
+      op32 = 0;
+    }
     node_t operand_node = NL_HEAD (r->u.ops);
     op_t dst_op = gen (c2m_ctx, operand_node, FALSE);
     invalidate_cached_var (c2m_ctx, dst_op.decl);
@@ -11124,13 +11749,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
     if (dst_op.kind == OPK_REG) {
       /* Promoted var: write directly */
       sljit_emit_op2 (compiler, (r->code == N_INC ? SLJIT_ADD : SLJIT_SUB) | op32,
-                       dst_op.reg, 0, dst_op.reg, 0, SLJIT_IMM, 1);
+                       dst_op.reg, 0, dst_op.reg, 0, SLJIT_IMM, step);
       return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst_op.reg, .imm = 0, .base = 0};
     }
     op_t cur = load_from_mem (c2m_ctx, dst_op, size, TRUE);
     sljit_s32 res = get_temp_reg (c2m_ctx);
     sljit_emit_op2 (compiler, (r->code == N_INC ? SLJIT_ADD : SLJIT_SUB) | op32, res, 0, cur.reg, 0,
-                     SLJIT_IMM, 1);
+                     SLJIT_IMM, step);
     op_t result = {.decl = NULL, .kind = OPK_REG, .reg = res, .imm = 0, .base = 0};
     /* Opt 9: defer store for pre-inc/dec */
     if (c2m_options->opt_defer_store_p && c2m_options->opt_reg_cache_p
@@ -11147,6 +11772,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
   case N_POST_INC:
   case N_POST_DEC: {
     int op32 = (type != NULL && sljit_type_size (type) == 4) ? SLJIT_32 : 0;
+    sljit_sw step = 1;
+    if (type != NULL && type->mode == TM_PTR) {
+      step = (type->u.ptr_type->mode == TM_FUNC) ? 1 : (sljit_sw) type_size (c2m_ctx, type->u.ptr_type);
+      op32 = 0;
+    }
     node_t operand_node = NL_HEAD (r->u.ops);
     op_t dst_op = gen (c2m_ctx, operand_node, FALSE);
     invalidate_cached_var (c2m_ctx, dst_op.decl);
@@ -11156,7 +11786,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
       sljit_s32 saved = get_temp_reg (c2m_ctx);
       sljit_emit_op1 (compiler, SLJIT_MOV, saved, 0, dst_op.reg, 0);
       sljit_emit_op2 (compiler, (r->code == N_POST_INC ? SLJIT_ADD : SLJIT_SUB) | op32,
-                       dst_op.reg, 0, dst_op.reg, 0, SLJIT_IMM, 1);
+                       dst_op.reg, 0, dst_op.reg, 0, SLJIT_IMM, step);
       return (op_t){.decl = NULL, .kind = OPK_REG, .reg = saved, .imm = 0, .base = 0};
     }
     op_t cur = load_from_mem (c2m_ctx, dst_op, size, TRUE);
@@ -11164,7 +11794,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
     sljit_emit_op1 (compiler, SLJIT_MOV, saved, 0, cur.reg, 0);  /* save original */
     sljit_s32 res = get_temp_reg (c2m_ctx);
     sljit_emit_op2 (compiler, (r->code == N_POST_INC ? SLJIT_ADD : SLJIT_SUB) | op32, res, 0, cur.reg, 0,
-                     SLJIT_IMM, 1);
+                     SLJIT_IMM, step);
     op_t new_val = {.decl = NULL, .kind = OPK_REG, .reg = res, .imm = 0, .base = 0};
     /* Opt 9: defer store for post-inc/dec */
     if (c2m_options->opt_defer_store_p && c2m_options->opt_reg_cache_p
@@ -11187,14 +11817,74 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
     op_t val = gen (c2m_ctx, operand_node, TRUE);
     int dst_size = type != NULL ? sljit_type_size (type) : (int) sizeof (sljit_sw);
     int src_size = src_type != NULL ? sljit_type_size (src_type) : (int) sizeof (sljit_sw);
-    /* Widening from int to long: sign-extend */
-    if (dst_size > src_size && src_size == 4) {
+    /* Float ↔ int conversions */
+    if (is_float_type (type) && !is_float_type (src_type)) {
+      /* Int → float */
+      int f32 = is_f32_type (type);
       op_t vr = force_reg (c2m_ctx, val);
+      sljit_s32 dst = get_float_temp_reg (c2m_ctx);
+      sljit_s32 conv_op = (src_size <= 4)
+                             ? (f32 ? SLJIT_CONV_F32_FROM_S32 : SLJIT_CONV_F64_FROM_S32)
+                             : (f32 ? SLJIT_CONV_F32_FROM_SW : SLJIT_CONV_F64_FROM_SW);
+      sljit_emit_fop1 (compiler, conv_op, dst, 0, vr.reg, 0);
+      return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = dst, .imm = 0, .base = 0};
+    }
+    if (!is_float_type (type) && is_float_type (src_type)) {
+      /* Float → int */
+      int f32 = is_f32_type (src_type);
+      op_t vr = force_freg (c2m_ctx, val, f32);
       sljit_s32 dst = get_temp_reg (c2m_ctx);
-      sljit_emit_op1 (compiler, SLJIT_MOV_S32, dst, 0, vr.reg, 0);
+      sljit_s32 conv_op = (dst_size <= 4)
+                             ? (f32 ? SLJIT_CONV_S32_FROM_F32 : SLJIT_CONV_S32_FROM_F64)
+                             : (f32 ? SLJIT_CONV_SW_FROM_F32 : SLJIT_CONV_SW_FROM_F64);
+      sljit_emit_fop1 (compiler, conv_op, dst, 0, vr.reg, 0);
       return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
     }
-    return force_reg (c2m_ctx, val);
+    if (is_float_type (type) && is_float_type (src_type)) {
+      /* Float → float (e.g., float ↔ double) */
+      int src_f32 = is_f32_type (src_type);
+      int dst_f32 = is_f32_type (type);
+      op_t vr = force_freg (c2m_ctx, val, src_f32);
+      if (src_f32 == dst_f32) return vr;
+      sljit_s32 dst = get_float_temp_reg (c2m_ctx);
+      sljit_emit_fop1 (compiler, dst_f32 ? SLJIT_CONV_F32_FROM_F64 : SLJIT_CONV_F64_FROM_F32,
+                        dst, 0, vr.reg, 0);
+      return (op_t){.decl = NULL, .kind = OPK_FREG, .reg = dst, .imm = 0, .base = 0};
+    }
+    /* Pointer ↔ int: same-size reinterpret, no conversion needed */
+    if (type != NULL && (type->mode == TM_PTR || type->mode == TM_ARR))
+      return force_reg (c2m_ctx, val);
+    if (src_type != NULL && (src_type->mode == TM_PTR || src_type->mode == TM_ARR))
+      return force_reg (c2m_ctx, val);
+    if (dst_size == src_size) return force_reg (c2m_ctx, val);
+    /* Determine signedness of source type */
+    int src_signed
+      = src_type != NULL && src_type->mode == TM_BASIC
+        && (src_type->u.basic_type == TP_CHAR || src_type->u.basic_type == TP_SCHAR
+            || src_type->u.basic_type == TP_SHORT || src_type->u.basic_type == TP_INT
+            || src_type->u.basic_type == TP_LONG || src_type->u.basic_type == TP_LLONG);
+    op_t vr = force_reg (c2m_ctx, val);
+    sljit_s32 dst = get_temp_reg (c2m_ctx);
+    sljit_s32 mov_op;
+    if (dst_size < src_size) {
+      /* Truncation: mask to destination size */
+      switch (dst_size) {
+      case 1: mov_op = SLJIT_MOV_U8; break;
+      case 2: mov_op = SLJIT_MOV_U16; break;
+      case 4: mov_op = SLJIT_MOV_U32; break;
+      default: mov_op = SLJIT_MOV; break;
+      }
+    } else {
+      /* Widening: sign or zero extend from source size */
+      switch (src_size) {
+      case 1: mov_op = src_signed ? SLJIT_MOV_S8 : SLJIT_MOV_U8; break;
+      case 2: mov_op = src_signed ? SLJIT_MOV_S16 : SLJIT_MOV_U16; break;
+      case 4: mov_op = src_signed ? SLJIT_MOV_S32 : SLJIT_MOV_U32; break;
+      default: mov_op = SLJIT_MOV; break;
+      }
+    }
+    sljit_emit_op1 (compiler, mov_op, dst, 0, vr.reg, 0);
+    return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
   }
 
   /* ---- Ternary conditional ---- */
@@ -11262,7 +11952,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
     op_t operand = gen (c2m_ctx, NL_HEAD (r->u.ops), FALSE);
     if (operand.kind == OPK_MEM) {
       sljit_s32 dst = get_temp_reg (c2m_ctx);
-      sljit_get_local_base (compiler, dst, 0, operand.imm);
+      if (operand.base == 0) {
+        /* Global variable: address is the absolute value in imm */
+        sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_IMM, operand.imm);
+      } else {
+        /* Local variable: address is SP + offset */
+        sljit_get_local_base (compiler, dst, 0, operand.imm);
+      }
       return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
     }
     return operand;
@@ -11280,37 +11976,254 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, int val_p) {
     return (op_t){.decl = NULL, .kind = OPK_MEM, .reg = 0, .imm = 0, .base = ptr.reg};
   }
 
+  /* ---- Struct field access (s.field) ---- */
+  case N_FIELD: {
+    node_t base_node = NL_HEAD (r->u.ops);
+    /* Get base struct as a memory location (not loaded) */
+    op_t base_op = gen (c2m_ctx, base_node, FALSE);
+    /* Get field member decl for offset */
+    struct expr *field_e = r->attr;
+    decl_t member_decl = field_e->u.lvalue_node != NULL ? field_e->u.lvalue_node->attr : NULL;
+    sljit_sw field_offset = member_decl != NULL ? (sljit_sw) member_decl->offset : 0;
+    if (base_op.kind == OPK_MEM) {
+      /* Add field offset to the base memory operand */
+      op_t result = base_op;
+      result.imm += field_offset;
+      result.decl = member_decl;
+      if (val_p) {
+        int size = type != NULL ? sljit_type_size (type) : (int) sizeof (sljit_sw);
+        int is_signed = type != NULL && type->mode == TM_BASIC && signed_integer_type_p (type);
+        return load_from_mem (c2m_ctx, result, size, is_signed);
+      }
+      return result;
+    }
+    /* Base is a register (shouldn't normally happen for struct values) */
+    return void_op;
+  }
+
+  /* ---- Pointer field access (p->field) ---- */
+  case N_DEREF_FIELD: {
+    node_t base_node = NL_HEAD (r->u.ops);
+    op_t ptr = force_reg (c2m_ctx, gen (c2m_ctx, base_node, TRUE));
+    struct expr *field_e = r->attr;
+    decl_t member_decl = field_e->u.lvalue_node != NULL ? field_e->u.lvalue_node->attr : NULL;
+    sljit_sw field_offset = member_decl != NULL ? (sljit_sw) member_decl->offset : 0;
+    op_t result
+      = (op_t){.decl = member_decl, .kind = OPK_MEM, .reg = 0, .imm = field_offset, .base = ptr.reg};
+    if (val_p) {
+      int size = type != NULL ? sljit_type_size (type) : (int) sizeof (sljit_sw);
+      int is_signed = type != NULL && type->mode == TM_BASIC && signed_integer_type_p (type);
+      return load_from_mem (c2m_ctx, result, size, is_signed);
+    }
+    return result;
+  }
+
   /* ---- Array indexing ---- */
   case N_IND: {
     node_t arr_node = NL_HEAD (r->u.ops);
     node_t idx_node = NL_NEXT (arr_node);
-    op_t arr = force_reg (c2m_ctx, gen (c2m_ctx, arr_node, TRUE));
+    op_t arr = gen (c2m_ctx, arr_node, TRUE);
     op_t idx = force_reg (c2m_ctx, gen (c2m_ctx, idx_node, TRUE));
-    /* Compute element size from the pointed-to type */
-    int elem_size = sizeof (sljit_sw);  /* default */
-    if (type != NULL) elem_size = sljit_type_size (type);
+    arr = force_reg (c2m_ctx, arr);
+    /* Compute element size (stride) from the pointed-to type */
+    int elem_size = (int) sizeof (sljit_sw);  /* default */
+    if (type != NULL) elem_size = (int) type_size (c2m_ctx, type);
     sljit_s32 offset_reg = get_temp_reg (c2m_ctx);
     sljit_emit_op2 (compiler, SLJIT_MUL, offset_reg, 0, idx.reg, 0, SLJIT_IMM, elem_size);
     sljit_s32 addr_reg = get_temp_reg (c2m_ctx);
     sljit_emit_op2 (compiler, SLJIT_ADD, addr_reg, 0, arr.reg, 0, offset_reg, 0);
     if (val_p) {
-      sljit_s32 dst = get_temp_reg (c2m_ctx);
-      sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_MEM1 (addr_reg), 0);
-      return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
+      int size = type != NULL ? sljit_type_size (type) : (int) sizeof (sljit_sw);
+      int is_signed = type != NULL && type->mode == TM_BASIC && signed_integer_type_p (type);
+      return load_from_mem (c2m_ctx,
+                            (op_t){.decl = NULL, .kind = OPK_MEM, .reg = 0, .imm = 0, .base = addr_reg},
+                            size, is_signed);
     }
     return (op_t){.decl = NULL, .kind = OPK_MEM, .reg = 0, .imm = 0, .base = addr_reg};
   }
 
   /* ---- Function call ---- */
+  /* ---- Function call ---- */
   case N_CALL: {
-    /* Simplified: only supports calls to known functions with integer args/return */
-    /* TODO: proper ABI support, floating point, struct return */
     node_t func_node = NL_HEAD (r->u.ops);
-    (void) func_node;
-    /* For now, return 0 as placeholder */
-    sljit_s32 dst = get_temp_reg (c2m_ctx);
-    sljit_emit_op1 (compiler, SLJIT_MOV, dst, 0, SLJIT_IMM, 0);
-    return (op_t){.decl = NULL, .kind = OPK_REG, .reg = dst, .imm = 0, .base = 0};
+    node_t arg_list_node = NL_NEXT (func_node);
+    sljit_sw func_save = gen_ctx->call_save_offset + gen_ctx->call_arg_slots * (sljit_sw) sizeof (sljit_sw);
+
+    /* Detect variadic calls: get callee function type */
+    int is_variadic = 0;
+    int n_fixed_params = 0;  /* number of fixed (non-variadic) params */
+    {
+      struct expr *func_e = func_node->attr;
+      struct type *callee_type = func_e != NULL ? func_e->type : NULL;
+      /* N_CALL's func_node type is ptr-to-func; dereference */
+      if (callee_type != NULL && callee_type->mode == TM_PTR)
+        callee_type = callee_type->u.ptr_type;
+      if (callee_type != NULL && callee_type->mode == TM_FUNC) {
+        is_variadic = callee_type->u.func_type->dots_p;
+        if (callee_type->u.func_type->param_list != NULL) {
+          for (node_t p = NL_HEAD (callee_type->u.func_type->param_list->u.ops);
+               p != NULL; p = NL_NEXT (p)) {
+            if (p->code == N_DOTS) break;
+            n_fixed_params++;
+          }
+        }
+      }
+      /* For variadic calls, all args beyond fixed params will have their float values
+         bitcast to integers (ARM64 ABI: variadic args go through GPRs/stack).
+         Variadic external calls go through c2sljit_call_variadic trampoline. */
+    }
+
+    /* Step 1: For indirect calls via expression, evaluate func ptr first and save */
+    int call_mode = 0; /* 0=direct external, 1=indirect slot, 2=indirect expr */
+    sljit_sw func_addr = 0;
+
+    if (func_node->code == N_ID) {
+      const char *name = func_node->u.s.s;
+      struct func_slot *slot = find_func_slot (c2m_ctx, name);
+      if (slot != NULL) {
+        call_mode = 1;
+        func_addr = (sljit_sw) &slot->code_addr; /* address of the slot */
+      } else {
+        void *addr = dlsym (RTLD_DEFAULT, name);
+        func_addr = (sljit_sw) addr;
+      }
+    } else {
+      /* Function pointer expression — evaluate and save to stack */
+      reset_temp_regs (c2m_ctx);
+      op_t fop = force_reg (c2m_ctx, gen (c2m_ctx, func_node, TRUE));
+      sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_MEM1 (SLJIT_SP), func_save, fop.reg, 0);
+      call_mode = 2;
+    }
+
+    /* Step 2: Evaluate all arguments, determine types, save to stack.
+       For variadic args beyond the fixed params, float values are bitcast to integer
+       (ABI requires variadic doubles in GPRs on most platforms).
+       Variadic external calls support up to 10 args; non-variadic up to 4. */
+    int max_args = (is_variadic && call_mode != 1) ? 10 : 4;
+    int nargs = 0;
+    int arg_is_float[10] = {0};
+    int arg_is_f32[10] = {0};
+    if (arg_list_node != NULL && arg_list_node->code == N_LIST) {
+      for (node_t arg = NL_HEAD (arg_list_node->u.ops); arg != NULL && nargs < max_args;
+           arg = NL_NEXT (arg)) {
+        reset_temp_regs (c2m_ctx);
+        struct expr *arg_e = arg->attr;
+        struct type *arg_type = arg_e != NULL ? arg_e->type : NULL;
+        sljit_sw slot_offset = gen_ctx->call_save_offset + nargs * (sljit_sw) sizeof (sljit_sw);
+        int is_vararg = is_variadic && nargs >= n_fixed_params;
+        if (is_float_type (arg_type) && !is_vararg) {
+          /* Fixed float param — pass in FP register */
+          arg_is_float[nargs] = 1;
+          arg_is_f32[nargs] = is_f32_type (arg_type);
+          op_t a = force_freg (c2m_ctx, gen (c2m_ctx, arg, TRUE), arg_is_f32[nargs]);
+          sljit_emit_fop1 (compiler, arg_is_f32[nargs] ? SLJIT_MOV_F32 : SLJIT_MOV_F64,
+                           SLJIT_MEM1 (SLJIT_SP), slot_offset, a.reg, 0);
+        } else if (is_float_type (arg_type) && is_vararg) {
+          /* Variadic float arg — bitcast to integer for ABI compliance */
+          op_t a = force_freg (c2m_ctx, gen (c2m_ctx, arg, TRUE), 0 /* always promote to f64 */);
+          sljit_s32 ireg = get_temp_reg (c2m_ctx);
+          sljit_emit_fcopy (compiler, SLJIT_COPY_FROM_F64, a.reg, ireg);
+          sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_MEM1 (SLJIT_SP), slot_offset, ireg, 0);
+          /* arg_is_float stays 0 — treated as integer */
+        } else {
+          op_t a = force_reg (c2m_ctx, gen (c2m_ctx, arg, TRUE));
+          sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_MEM1 (SLJIT_SP), slot_offset, a.reg, 0);
+        }
+        nargs++;
+      }
+    }
+
+    int void_ret
+      = (type != NULL && type->mode == TM_BASIC && type->u.basic_type == TP_VOID);
+    int ret_is_float = is_float_type (type);
+
+    /* Invalidate register cache (scratch regs destroyed by call) */
+    invalidate_reg_cache (c2m_ctx);
+
+    if (is_variadic && call_mode != 1) {
+      /* Variadic external call — dispatch through C trampoline.
+         The trampoline takes 4 args: (fn_addr, n_fixed, n_total, args_ptr).
+         It uses function pointer casts so the host C compiler generates correct
+         variadic ABI (fixed args in registers, variadic args on stack). */
+
+      /* R0 = function address */
+      if (call_mode == 2)
+        sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM1 (SLJIT_SP), func_save);
+      else
+        sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, func_addr);
+
+      /* R1 = n_fixed_params */
+      sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, n_fixed_params);
+
+      /* R2 = nargs (total) */
+      sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, nargs);
+
+      /* R3 = pointer to args array on stack */
+      sljit_get_local_base (compiler, SLJIT_R3, 0, gen_ctx->call_save_offset);
+
+      /* Call trampoline — non-variadic, 4 integer args */
+      sljit_emit_icall (compiler, SLJIT_CALL, SLJIT_ARGS4 (W, W, W, W, W),
+                        SLJIT_IMM, (sljit_sw) c2sljit_call_variadic);
+    } else {
+      /* Non-variadic call (or internal variadic via slot) — original path */
+
+      /* Step 3: Load args into registers.  Integer args → R0,R1,... Float args → FR0,FR1,...
+         Each type uses independent register numbering. */
+      int int_idx = 0, float_idx = 0;
+      for (int i = 0; i < nargs; i++) {
+        sljit_sw slot_offset = gen_ctx->call_save_offset + i * (sljit_sw) sizeof (sljit_sw);
+        if (arg_is_float[i]) {
+          sljit_emit_fop1 (compiler, arg_is_f32[i] ? SLJIT_MOV_F32 : SLJIT_MOV_F64,
+                           SLJIT_FR0 + float_idx, 0, SLJIT_MEM1 (SLJIT_SP), slot_offset);
+          float_idx++;
+        } else {
+          sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_R0 + int_idx, 0,
+                           SLJIT_MEM1 (SLJIT_SP), slot_offset);
+          int_idx++;
+        }
+      }
+
+      /* Step 4: Load function address for indirect calls.
+         Use R register after all integer args. */
+      sljit_s32 func_reg = SLJIT_R0 + int_idx;
+      if (call_mode == 1) {
+        sljit_emit_op1 (compiler, SLJIT_MOV, func_reg, 0, SLJIT_IMM, func_addr);
+        sljit_emit_op1 (compiler, SLJIT_MOV, func_reg, 0, SLJIT_MEM1 (func_reg), 0);
+      } else if (call_mode == 2) {
+        sljit_emit_op1 (compiler, SLJIT_MOV, func_reg, 0, SLJIT_MEM1 (SLJIT_SP), func_save);
+      }
+
+      /* Build arg_types with proper float/int type info.
+         Variadic float args that were bitcast are typed as W (integer). */
+      sljit_s32 call_arg_types = void_ret ? SLJIT_ARG_TYPE_RET_VOID : sljit_arg_type_for (type);
+      for (int i = 0; i < nargs; i++) {
+        sljit_s32 at = arg_is_float[i]
+                         ? (arg_is_f32[i] ? SLJIT_ARG_TYPE_F32 : SLJIT_ARG_TYPE_F64)
+                         : SLJIT_ARG_TYPE_W;
+        call_arg_types |= (at << (SLJIT_ARG_SHIFT * (i + 1)));
+      }
+
+      /* Emit the call */
+      if (call_mode == 0) {
+        sljit_emit_icall (compiler, SLJIT_CALL, call_arg_types, SLJIT_IMM, func_addr);
+      } else {
+        sljit_emit_icall (compiler, SLJIT_CALL, call_arg_types, func_reg, 0);
+      }
+    }
+
+    if (void_ret) return void_op;
+
+    /* Save return value to a stable stack slot so it survives subsequent calls */
+    int ret_slot = gen_ctx->call_ret_slot++;
+    sljit_sw ret_offset = gen_ctx->call_ret_base + ret_slot * (sljit_sw) sizeof (sljit_sw);
+    if (ret_is_float) {
+      int f32 = is_f32_type (type);
+      sljit_emit_fop1 (compiler, f32 ? SLJIT_MOV_F32 : SLJIT_MOV_F64,
+                       SLJIT_MEM1 (SLJIT_SP), ret_offset, SLJIT_FR0, 0);
+      return (op_t){.decl = NULL, .kind = OPK_MEM, .reg = 0, .imm = ret_offset, .base = SLJIT_SP};
+    }
+    sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_MEM1 (SLJIT_SP), ret_offset, SLJIT_R0, 0);
+    return (op_t){.decl = NULL, .kind = OPK_MEM, .reg = 0, .imm = ret_offset, .base = SLJIT_SP};
   }
 
   /* ---- Sizeof ---- */
@@ -11366,9 +12279,9 @@ static op_t gen_right_operand (c2m_ctx_t c2m_ctx, node_t n) {
     if (decl != NULL) {
       op_t v = var_op (c2m_ctx, decl);
       if (v.kind == OPK_REG) return v;  /* promoted: always usable directly */
-      if (v.kind == OPK_MEM && e->type != NULL
+      if (v.kind == OPK_MEM && v.base != 0 && e->type != NULL
           && sljit_type_size (e->type) >= (int) sizeof (sljit_sw))
-        return v;  /* word-sized memory operand */
+        return v;  /* word-sized stack memory operand (not global) */
     }
     break;
   }
@@ -11382,6 +12295,27 @@ static op_t gen_right_operand (c2m_ctx_t c2m_ctx, node_t n) {
 static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   if (r == NULL || r->code == N_IGNORE) return;
+  gen_ctx->call_ret_slot = 0; /* reset call return save slots at statement boundary */
+
+  /* Process labels (child 0 is N_LIST of labels for most statement nodes).
+     Emit sljit labels for N_LABEL, N_CASE, N_DEFAULT so gotos/switch can target this statement. */
+  if (node_has_ops (r->code) && r->code != N_LIST && r->code != N_BLOCK) {
+    node_t labels_list = NL_HEAD (r->u.ops);
+    if (labels_list != NULL && labels_list->code == N_LIST) {
+      for (node_t l = NL_HEAD (labels_list->u.ops); l != NULL; l = NL_NEXT (l)) {
+        if (l->code == N_LABEL || l->code == N_CASE || l->code == N_DEFAULT) {
+          invalidate_reg_cache (c2m_ctx);
+          struct label_entry *le = get_or_add_label (c2m_ctx, r);
+          if (le != NULL && le->label == NULL) {
+            le->label = sljit_emit_label (compiler);
+            for (int i = 0; i < le->n_pending; i++)
+              sljit_set_label (le->pending[i], le->label);
+            le->n_pending = 0;
+          }
+        }
+      }
+    }
+  }
 
   switch (r->code) {
   /* ---- Expression statement ---- */
@@ -11425,33 +12359,57 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
     break;
   }
 
-  /* ---- While loop ---- */
+  /* ---- While loop (inverted: bottom-tested) ---- */
   case N_WHILE: {
     node_t cond_node = NL_EL (r->u.ops, 1);
     node_t body_node = NL_NEXT (cond_node);
+    int has_continue = scan_has_continue (body_node);
+    /* Save outer loop state */
     struct sljit_label *saved_continue = gen_ctx->continue_label;
     struct sljit_jump **saved_break_jumps = gen_ctx->break_jumps;
     int saved_break_count = gen_ctx->break_jump_count;
     int saved_break_cap = gen_ctx->break_jump_cap;
-    gen_ctx->continue_label = sljit_emit_label (compiler);
-    invalidate_reg_cache (c2m_ctx);
+    struct sljit_jump **saved_cont_jumps = gen_ctx->continue_jumps;
+    int saved_cont_count = gen_ctx->continue_jump_count;
+    int saved_cont_cap = gen_ctx->continue_jump_cap;
     gen_ctx->break_jumps = NULL;
     gen_ctx->break_jump_count = 0;
     gen_ctx->break_jump_cap = 0;
+    gen_ctx->continue_jumps = NULL;
+    gen_ctx->continue_jump_count = 0;
+    gen_ctx->continue_jump_cap = 0;
+    gen_ctx->continue_label = NULL;  /* deferred: body uses continue_jumps */
+    /* Guard: test condition once before entering loop */
+    invalidate_reg_cache (c2m_ctx);
     reset_temp_regs (c2m_ctx);
-    struct sljit_jump *exit_jump = emit_cond_branch (c2m_ctx, cond_node, TRUE);
+    struct sljit_jump *guard_jump = emit_cond_branch (c2m_ctx, cond_node, TRUE);
+    /* Loop top */
+    struct sljit_label *loop_top = sljit_emit_label (compiler);
+    invalidate_reg_cache (c2m_ctx);
     gen_stmt (c2m_ctx, body_node);
-    sljit_set_label (sljit_emit_jump (compiler, SLJIT_JUMP), gen_ctx->continue_label);
+    /* Continue label (target for continue statements) */
+    gen_ctx->continue_label = sljit_emit_label (compiler);
+    if (has_continue) invalidate_reg_cache (c2m_ctx);
+    patch_continue_jumps (c2m_ctx, gen_ctx->continue_label);
+    /* Bottom test: branch back to loop_top if condition is true */
+    reset_temp_regs (c2m_ctx);
+    sljit_set_label (emit_cond_branch (c2m_ctx, cond_node, FALSE), loop_top);
+    /* After loop */
     struct sljit_label *after = sljit_emit_label (compiler);
-    sljit_set_label (exit_jump, after);
+    sljit_set_label (guard_jump, after);
     for (int i = 0; i < gen_ctx->break_jump_count; i++)
       sljit_set_label (gen_ctx->break_jumps[i], after);
     free (gen_ctx->break_jumps);
+    free (gen_ctx->continue_jumps);
     invalidate_reg_cache (c2m_ctx);
+    /* Restore outer loop state */
     gen_ctx->continue_label = saved_continue;
     gen_ctx->break_jumps = saved_break_jumps;
     gen_ctx->break_jump_count = saved_break_count;
     gen_ctx->break_jump_cap = saved_break_cap;
+    gen_ctx->continue_jumps = saved_cont_jumps;
+    gen_ctx->continue_jump_count = saved_cont_count;
+    gen_ctx->continue_jump_cap = saved_cont_cap;
     break;
   }
 
@@ -11459,45 +12417,71 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
   case N_DO: {
     node_t cond_node = NL_EL (r->u.ops, 1);
     node_t body_node = NL_NEXT (cond_node);
+    int has_continue = scan_has_continue (body_node);
+    /* Save outer loop state */
     struct sljit_label *saved_continue = gen_ctx->continue_label;
     struct sljit_jump **saved_break_jumps = gen_ctx->break_jumps;
     int saved_break_count = gen_ctx->break_jump_count;
     int saved_break_cap = gen_ctx->break_jump_cap;
-    struct sljit_label *loop_start = sljit_emit_label (compiler);
-    invalidate_reg_cache (c2m_ctx);
+    struct sljit_jump **saved_cont_jumps = gen_ctx->continue_jumps;
+    int saved_cont_count = gen_ctx->continue_jump_count;
+    int saved_cont_cap = gen_ctx->continue_jump_cap;
     gen_ctx->break_jumps = NULL;
     gen_ctx->break_jump_count = 0;
     gen_ctx->break_jump_cap = 0;
-    gen_stmt (c2m_ctx, body_node);
-    gen_ctx->continue_label = sljit_emit_label (compiler);
+    gen_ctx->continue_jumps = NULL;
+    gen_ctx->continue_jump_count = 0;
+    gen_ctx->continue_jump_cap = 0;
+    gen_ctx->continue_label = NULL;  /* deferred: body uses continue_jumps */
+    struct sljit_label *loop_start = sljit_emit_label (compiler);
     invalidate_reg_cache (c2m_ctx);
+    gen_stmt (c2m_ctx, body_node);
+    /* Continue label */
+    gen_ctx->continue_label = sljit_emit_label (compiler);
+    if (has_continue) invalidate_reg_cache (c2m_ctx);
+    patch_continue_jumps (c2m_ctx, gen_ctx->continue_label);
     reset_temp_regs (c2m_ctx);
     sljit_set_label (emit_cond_branch (c2m_ctx, cond_node, FALSE), loop_start);
     struct sljit_label *after = sljit_emit_label (compiler);
     for (int i = 0; i < gen_ctx->break_jump_count; i++)
       sljit_set_label (gen_ctx->break_jumps[i], after);
     free (gen_ctx->break_jumps);
+    free (gen_ctx->continue_jumps);
     invalidate_reg_cache (c2m_ctx);
+    /* Restore outer loop state */
     gen_ctx->continue_label = saved_continue;
     gen_ctx->break_jumps = saved_break_jumps;
     gen_ctx->break_jump_count = saved_break_count;
     gen_ctx->break_jump_cap = saved_break_cap;
+    gen_ctx->continue_jumps = saved_cont_jumps;
+    gen_ctx->continue_jump_count = saved_cont_count;
+    gen_ctx->continue_jump_cap = saved_cont_cap;
     break;
   }
 
-  /* ---- For loop ---- */
+  /* ---- For loop (inverted: bottom-tested) ---- */
   case N_FOR: {
     node_t init_node = NL_EL (r->u.ops, 1);
     node_t cond_node = NL_NEXT (init_node);
     node_t iter_node = NL_NEXT (cond_node);
     node_t body_node = NL_NEXT (iter_node);
+    int has_cond = (cond_node != NULL && cond_node->code != N_IGNORE);
+    int has_continue = scan_has_continue (body_node);
+    /* Save outer loop state */
     struct sljit_label *saved_continue = gen_ctx->continue_label;
     struct sljit_jump **saved_break_jumps = gen_ctx->break_jumps;
     int saved_break_count = gen_ctx->break_jump_count;
     int saved_break_cap = gen_ctx->break_jump_cap;
+    struct sljit_jump **saved_cont_jumps = gen_ctx->continue_jumps;
+    int saved_cont_count = gen_ctx->continue_jump_count;
+    int saved_cont_cap = gen_ctx->continue_jump_cap;
     gen_ctx->break_jumps = NULL;
     gen_ctx->break_jump_count = 0;
     gen_ctx->break_jump_cap = 0;
+    gen_ctx->continue_jumps = NULL;
+    gen_ctx->continue_jump_count = 0;
+    gen_ctx->continue_jump_cap = 0;
+    gen_ctx->continue_label = NULL;  /* deferred: body uses continue_jumps */
     /* Init */
     if (init_node != NULL && init_node->code != N_IGNORE) {
       reset_temp_regs (c2m_ctx);
@@ -11508,35 +12492,50 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
         gen (c2m_ctx, init_node, FALSE);
       }
     }
+    /* Guard: test condition once before entering loop (skip for infinite loops) */
+    struct sljit_jump *guard_jump = NULL;
+    if (has_cond) {
+      invalidate_reg_cache (c2m_ctx);
+      reset_temp_regs (c2m_ctx);
+      guard_jump = emit_cond_branch (c2m_ctx, cond_node, TRUE);
+    }
+    /* Loop top */
     struct sljit_label *loop_top = sljit_emit_label (compiler);
     invalidate_reg_cache (c2m_ctx);
-    struct sljit_jump *exit_jump = NULL;
-    /* Condition */
-    if (cond_node != NULL && cond_node->code != N_IGNORE) {
-      reset_temp_regs (c2m_ctx);
-      exit_jump = emit_cond_branch (c2m_ctx, cond_node, TRUE);
-    }
     /* Body */
     gen_stmt (c2m_ctx, body_node);
     /* Continue label (before iteration) */
     gen_ctx->continue_label = sljit_emit_label (compiler);
-    invalidate_reg_cache (c2m_ctx);
+    if (has_continue) invalidate_reg_cache (c2m_ctx);
+    patch_continue_jumps (c2m_ctx, gen_ctx->continue_label);
     /* Iteration */
     if (iter_node != NULL && iter_node->code != N_IGNORE) {
       reset_temp_regs (c2m_ctx);
       gen (c2m_ctx, iter_node, FALSE);
     }
-    sljit_set_label (sljit_emit_jump (compiler, SLJIT_JUMP), loop_top);
+    /* Bottom test: branch back to loop_top if condition is true */
+    if (has_cond) {
+      reset_temp_regs (c2m_ctx);
+      sljit_set_label (emit_cond_branch (c2m_ctx, cond_node, FALSE), loop_top);
+    } else {
+      /* Infinite loop: unconditional back-edge */
+      sljit_set_label (sljit_emit_jump (compiler, SLJIT_JUMP), loop_top);
+    }
     struct sljit_label *after = sljit_emit_label (compiler);
-    if (exit_jump != NULL) sljit_set_label (exit_jump, after);
+    if (guard_jump != NULL) sljit_set_label (guard_jump, after);
     for (int i = 0; i < gen_ctx->break_jump_count; i++)
       sljit_set_label (gen_ctx->break_jumps[i], after);
     free (gen_ctx->break_jumps);
+    free (gen_ctx->continue_jumps);
     invalidate_reg_cache (c2m_ctx);
+    /* Restore outer loop state */
     gen_ctx->continue_label = saved_continue;
     gen_ctx->break_jumps = saved_break_jumps;
     gen_ctx->break_jump_count = saved_break_count;
     gen_ctx->break_jump_cap = saved_break_cap;
+    gen_ctx->continue_jumps = saved_cont_jumps;
+    gen_ctx->continue_jump_count = saved_cont_count;
+    gen_ctx->continue_jump_cap = saved_cont_cap;
     break;
   }
 
@@ -11547,9 +12546,17 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
       reset_temp_regs (c2m_ctx);
       struct expr *ret_e = expr->attr;
       struct type *ret_type = ret_e != NULL ? ret_e->type : NULL;
-      int ret_op = (ret_type != NULL && sljit_type_size (ret_type) == 4) ? SLJIT_MOV_S32 : SLJIT_MOV;
-      op_t val = force_reg (c2m_ctx, gen (c2m_ctx, expr, TRUE));
-      sljit_emit_return (compiler, ret_op, val.reg, 0);
+      op_t val = gen (c2m_ctx, expr, TRUE);
+      if (gen_ctx->func_returns_float) {
+        /* Float/double return */
+        int f32 = gen_ctx->func_returns_f32;
+        op_t fv = force_freg (c2m_ctx, val, f32);
+        sljit_emit_return (compiler, f32 ? SLJIT_MOV_F32 : SLJIT_MOV_F64, fv.reg, 0);
+      } else {
+        int ret_op = (ret_type != NULL && sljit_type_size (ret_type) == 4) ? SLJIT_MOV_S32 : SLJIT_MOV;
+        val = force_reg (c2m_ctx, val);
+        sljit_emit_return (compiler, ret_op, val.reg, 0);
+      }
     } else {
       sljit_emit_return_void (compiler);
     }
@@ -11558,8 +12565,19 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
 
   /* ---- Continue ---- */
   case N_CONTINUE: {
+    invalidate_reg_cache (c2m_ctx);
+    struct sljit_jump *j = sljit_emit_jump (compiler, SLJIT_JUMP);
     if (gen_ctx->continue_label != NULL) {
-      sljit_set_label (sljit_emit_jump (compiler, SLJIT_JUMP), gen_ctx->continue_label);
+      sljit_set_label (j, gen_ctx->continue_label);
+    } else {
+      /* Deferred patching for inverted loops */
+      if (gen_ctx->continue_jump_count >= gen_ctx->continue_jump_cap) {
+        gen_ctx->continue_jump_cap = gen_ctx->continue_jump_cap == 0
+          ? 8 : gen_ctx->continue_jump_cap * 2;
+        gen_ctx->continue_jumps = realloc (gen_ctx->continue_jumps,
+          gen_ctx->continue_jump_cap * sizeof (struct sljit_jump *));
+      }
+      gen_ctx->continue_jumps[gen_ctx->continue_jump_count++] = j;
     }
     break;
   }
@@ -11585,6 +12603,60 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
     if (decl == NULL) break;
     if (initializer != NULL && initializer->code != N_IGNORE) {
       reset_temp_regs (c2m_ctx);
+      /* Check for compound initializer list (structs/arrays) */
+      if (initializer->code == N_LIST) {
+        /* Compound initializer: N_LIST of N_INITs */
+        struct type *var_type = decl->decl_spec.type;
+        op_t base_op = var_op (c2m_ctx, decl);
+        if (var_type != NULL
+            && (var_type->mode == TM_STRUCT || var_type->mode == TM_UNION
+                || var_type->mode == TM_ARR)) {
+          /* Walk initializer elements and struct members in parallel */
+          node_t member_list = NULL;
+          node_t member = NULL;
+          if (var_type->mode == TM_STRUCT || var_type->mode == TM_UNION) {
+            member_list = var_type->u.tag_type;
+            if (member_list != NULL) {
+              node_t decl_list = NL_EL (member_list->u.ops, 1);
+              member = decl_list != NULL ? NL_HEAD (decl_list->u.ops) : NULL;
+            }
+          }
+          int arr_idx = 0;
+          for (node_t init_node = NL_HEAD (initializer->u.ops); init_node != NULL;
+               init_node = NL_NEXT (init_node)) {
+            if (init_node->code != N_INIT) continue;
+            node_t val_expr = NL_EL (init_node->u.ops, 1);
+            if (val_expr == NULL || val_expr->code == N_IGNORE) {
+              if (member != NULL) member = NL_NEXT (member);
+              arr_idx++;
+              continue;
+            }
+            reset_temp_regs (c2m_ctx);
+            sljit_sw field_offset = 0;
+            int field_size = (int) sizeof (sljit_sw);
+            if (member != NULL && member->code == N_MEMBER) {
+              decl_t md = member->attr;
+              if (md != NULL) {
+                field_offset = (sljit_sw) md->offset;
+                field_size = md->decl_spec.type != NULL ? sljit_type_size (md->decl_spec.type)
+                                                         : (int) sizeof (sljit_sw);
+              }
+              member = NL_NEXT (member);
+            } else if (var_type->mode == TM_ARR) {
+              struct type *elem_type = var_type->u.arr_type->el_type;
+              int elem_size = elem_type != NULL ? sljit_type_size (elem_type) : (int) sizeof (sljit_sw);
+              field_offset = arr_idx * elem_size;
+              field_size = elem_size;
+              arr_idx++;
+            }
+            op_t field_op = base_op;
+            field_op.imm += field_offset;
+            op_t val = gen (c2m_ctx, val_expr, TRUE);
+            store_to_mem (c2m_ctx, field_op, val, field_size);
+          }
+        }
+        break;
+      }
       node_t init_expr = initializer;
       /* For designated initializer lists (N_INIT), extract the expression */
       if (initializer->code == N_INIT) {
@@ -11594,7 +12666,12 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
         op_t dst_op = var_op (c2m_ctx, decl);
         int size = decl->decl_spec.type != NULL ? sljit_type_size (decl->decl_spec.type)
                                                  : (int) sizeof (sljit_sw);
-        if (dst_op.kind == OPK_REG) {
+        /* Float variable initialization */
+        if (is_float_type (decl->decl_spec.type)) {
+          int f32 = is_f32_type (decl->decl_spec.type);
+          op_t val = force_freg (c2m_ctx, gen (c2m_ctx, init_expr, TRUE), f32);
+          if (dst_op.kind == OPK_MEM) store_float_to_mem (c2m_ctx, dst_op, val, f32);
+        } else if (dst_op.kind == OPK_REG) {
           gen_ctx->assign_dest = dst_op.reg;
           op_t val = gen (c2m_ctx, init_expr, TRUE);
           gen_ctx->assign_dest = 0;
@@ -11609,33 +12686,106 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
     break;
   }
 
-  /* ---- Label ---- */
-  case N_LABEL: {
-    /* TODO: proper label support for goto */
-    invalidate_reg_cache (c2m_ctx);
-    node_t stmt = NL_EL (r->u.ops, 1);
-    gen_stmt (c2m_ctx, stmt);
+  /* N_LABEL: processed in the common label handler at top of gen_stmt.
+     If somehow reached here directly, just ignore (labels are child-0 of statements). */
+  case N_LABEL:
     break;
-  }
 
-  /* ---- Case/Default (within switch — TODO) ---- */
+  /* N_CASE/N_DEFAULT: processed as labels in the common label handler at top of gen_stmt. */
   case N_CASE:
-  case N_DEFAULT: {
-    node_t stmt = NL_TAIL (r->u.ops);
-    gen_stmt (c2m_ctx, stmt);
+  case N_DEFAULT:
     break;
-  }
 
-  /* ---- Switch (TODO: proper implementation) ---- */
+  /* ---- Switch ---- */
   case N_SWITCH: {
-    /* Placeholder: just execute the body without branching */
-    node_t body = NL_EL (r->u.ops, 1);
+    node_t expr = NL_EL (r->u.ops, 1);
+    node_t body = NL_NEXT (expr);
+    struct switch_attr *sa = (struct switch_attr *) r->attr;
+    if (sa == NULL) break;
+
+    /* Evaluate switch expression */
+    reset_temp_regs (c2m_ctx);
+    invalidate_reg_cache (c2m_ctx);
+    op_t sv = force_reg (c2m_ctx, gen (c2m_ctx, expr, TRUE));
+
+    /* Save break context */
+    struct sljit_jump **saved_break_jumps = gen_ctx->break_jumps;
+    int saved_break_count = gen_ctx->break_jump_count;
+    int saved_break_cap = gen_ctx->break_jump_cap;
+    gen_ctx->break_jumps = NULL;
+    gen_ctx->break_jump_count = 0;
+    gen_ctx->break_jump_cap = 0;
+
+    /* Emit dispatch: compare switch value with each case, jump on match */
+    struct label_entry *default_le = NULL;
+    for (case_t c = DLIST_HEAD (case_t, sa->case_labels); c != NULL;
+         c = DLIST_NEXT (case_t, c)) {
+      struct label_entry *le = get_or_add_label (c2m_ctx, c->case_target_node);
+      if (le == NULL) continue;
+      if (c->case_node->code == N_DEFAULT) {
+        default_le = le;
+        continue;
+      }
+      /* Get case value from the constant expression */
+      node_t case_expr = NL_HEAD (c->case_node->u.ops);
+      struct expr *ce = case_expr->attr;
+      sljit_sw case_val = ce->c.i_val;
+      struct sljit_jump *j = sljit_emit_cmp (compiler, SLJIT_EQUAL, sv.reg, 0,
+                                              SLJIT_IMM, case_val);
+      if (le->label != NULL) {
+        sljit_set_label (j, le->label);
+      } else if (le->n_pending < 8) {
+        le->pending[le->n_pending++] = j;
+      }
+    }
+
+    /* Jump to default or break if no case matched */
+    struct sljit_jump *no_match = sljit_emit_jump (compiler, SLJIT_JUMP);
+    if (default_le != NULL) {
+      if (default_le->label != NULL) {
+        sljit_set_label (no_match, default_le->label);
+      } else if (default_le->n_pending < 8) {
+        default_le->pending[default_le->n_pending++] = no_match;
+      }
+    }
+
+    /* Generate body */
     gen_stmt (c2m_ctx, body);
+
+    /* If no default, patch no_match to break label */
+    struct sljit_label *break_label = sljit_emit_label (compiler);
+    if (default_le == NULL) sljit_set_label (no_match, break_label);
+
+    /* Patch break jumps */
+    for (int i = 0; i < gen_ctx->break_jump_count; i++)
+      sljit_set_label (gen_ctx->break_jumps[i], break_label);
+    free (gen_ctx->break_jumps);
+
+    /* Restore break context */
+    gen_ctx->break_jumps = saved_break_jumps;
+    gen_ctx->break_jump_count = saved_break_count;
+    gen_ctx->break_jump_cap = saved_break_cap;
+    invalidate_reg_cache (c2m_ctx);
     break;
   }
 
-  /* ---- Goto (TODO) ---- */
-  case N_GOTO:
+  /* ---- Goto ---- */
+  case N_GOTO: {
+    invalidate_reg_cache (c2m_ctx);
+    node_t target = (node_t) r->attr; /* target N_LABEL node */
+    if (target != NULL) {
+      struct label_entry *le = get_or_add_label (c2m_ctx, target);
+      struct sljit_jump *j = sljit_emit_jump (compiler, SLJIT_JUMP);
+      if (le != NULL && le->label != NULL) {
+        /* Backward goto: label already emitted */
+        sljit_set_label (j, le->label);
+      } else if (le != NULL && le->n_pending < 8) {
+        /* Forward goto: save jump for patching when label is emitted */
+        le->pending[le->n_pending++] = j;
+      }
+    }
+    break;
+  }
   case N_INDIRECT_GOTO:
     break;
 
@@ -11660,10 +12810,19 @@ static void gen_stmt (c2m_ctx_t c2m_ctx, node_t r) {
 /* Count variable accesses in an AST subtree */
 struct var_count {
   decl_t decl;
-  int count;
+  const char *name;  /* variable name for verbose output */
+  int count;         /* weighted access count (loop depth weighted) */
 };
 
 #define MAX_VAR_COUNTS 32
+
+/* Weight per loop depth level: 10^depth */
+static int depth_weight (int depth) {
+  if (depth <= 0) return 1;
+  if (depth == 1) return 10;
+  if (depth == 2) return 100;
+  return 1000;
+}
 
 static int node_has_ops (node_code_t code) {
   /* Leaf nodes that store data in u.l/u.ll/u.ul/u.ch/u.s — NOT in u.ops */
@@ -11688,7 +12847,48 @@ static int node_has_ops (node_code_t code) {
   }
 }
 
-static void count_var_accesses (node_t n, struct var_count counts[], int *n_counts) {
+/* Scan loop body for N_CONTINUE targeting this loop (stops at nested loops). */
+static int scan_has_continue (node_t n) {
+  if (n == NULL || n->code == N_IGNORE) return 0;
+  if (n->code == N_CONTINUE) return 1;
+  if (n->code == N_WHILE || n->code == N_DO || n->code == N_FOR) return 0;
+  if (!node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (scan_has_continue (c)) return 1;
+  return 0;
+}
+
+static void patch_continue_jumps (c2m_ctx_t c2m_ctx, struct sljit_label *label) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  for (int i = 0; i < gen_ctx->continue_jump_count; i++)
+    sljit_set_label (gen_ctx->continue_jumps[i], label);
+}
+
+/* Scan function body to determine call save area requirements.
+   Sets *has_call to 1 if any N_CALL exists, *has_variadic_extern to 1
+   if any variadic external call exists (callee not in func_slots). */
+static void scan_calls (c2m_ctx_t c2m_ctx, node_t n, int *has_call, int *has_variadic_extern) {
+  if (n == NULL || n->code == N_IGNORE) return;
+  if (n->code == N_CALL) {
+    *has_call = 1;
+    node_t func_node = NL_HEAD (n->u.ops);
+    struct expr *func_e = func_node->attr;
+    struct type *ct = func_e != NULL ? func_e->type : NULL;
+    if (ct != NULL && ct->mode == TM_PTR) ct = ct->u.ptr_type;
+    if (ct != NULL && ct->mode == TM_FUNC && ct->u.func_type->dots_p) {
+      if (func_node->code != N_ID || find_func_slot (c2m_ctx, func_node->u.s.s) == NULL)
+        *has_variadic_extern = 1;
+    }
+    if (*has_variadic_extern) return;  /* already found worst case */
+  }
+  if (!node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
+    scan_calls (c2m_ctx, c, has_call, has_variadic_extern);
+    if (*has_variadic_extern) return;
+  }
+}
+
+static void count_var_accesses (node_t n, struct var_count counts[], int *n_counts, int depth) {
   if (n == NULL || n->code == N_IGNORE) return;
 
   if (n->code == N_ID) {
@@ -11696,15 +12896,17 @@ static void count_var_accesses (node_t n, struct var_count counts[], int *n_coun
     if (e != NULL && e->u.lvalue_node != NULL) {
       decl_t decl = e->u.lvalue_node->attr;
       if (decl != NULL && !decl->addr_p) {
+        int w = depth_weight (depth);
         for (int i = 0; i < *n_counts; i++) {
           if (counts[i].decl == decl) {
-            counts[i].count++;
+            counts[i].count += w;
             return;
           }
         }
         if (*n_counts < MAX_VAR_COUNTS) {
           counts[*n_counts].decl = decl;
-          counts[*n_counts].count = 1;
+          counts[*n_counts].name = n->u.s.s;
+          counts[*n_counts].count = w;
           (*n_counts)++;
         }
       }
@@ -11714,9 +12916,32 @@ static void count_var_accesses (node_t n, struct var_count counts[], int *n_coun
 
   if (!node_has_ops (n->code)) return;
 
-  /* Recurse into children */
+  /* For loops, increment depth for the body child */
+  if (n->code == N_FOR) {
+    /* N_FOR children: labels(0), init(1), cond(2), step(3), body(4) */
+    int idx = 0;
+    for (node_t child = NL_HEAD (n->u.ops); child != NULL; child = NL_NEXT (child), idx++)
+      count_var_accesses (child, counts, n_counts, idx == 4 ? depth + 1 : depth);
+    return;
+  }
+  if (n->code == N_WHILE) {
+    /* N_WHILE children: labels(0), cond(1), body(2) */
+    int idx = 0;
+    for (node_t child = NL_HEAD (n->u.ops); child != NULL; child = NL_NEXT (child), idx++)
+      count_var_accesses (child, counts, n_counts, idx == 2 ? depth + 1 : depth);
+    return;
+  }
+  if (n->code == N_DO) {
+    /* N_DO children: labels(0), body(1), cond(2) */
+    int idx = 0;
+    for (node_t child = NL_HEAD (n->u.ops); child != NULL; child = NL_NEXT (child), idx++)
+      count_var_accesses (child, counts, n_counts, idx == 1 ? depth + 1 : depth);
+    return;
+  }
+
+  /* Recurse into children at current depth */
   for (node_t child = NL_HEAD (n->u.ops); child != NULL; child = NL_NEXT (child))
-    count_var_accesses (child, counts, n_counts);
+    count_var_accesses (child, counts, n_counts, depth);
 }
 
 static int select_promotion_candidates (c2m_ctx_t c2m_ctx, node_t *nodes, int n_nodes,
@@ -11725,7 +12950,16 @@ static int select_promotion_candidates (c2m_ctx_t c2m_ctx, node_t *nodes, int n_
   struct var_count counts[MAX_VAR_COUNTS];
   int n_counts = 0;
 
-  for (int i = 0; i < n_nodes; i++) count_var_accesses (nodes[i], counts, &n_counts);
+  for (int i = 0; i < n_nodes; i++) count_var_accesses (nodes[i], counts, &n_counts, 0);
+
+  /* Verbose: print all candidates before selection */
+  if (c2m_options->verbose_p && c2m_options->message_file != NULL) {
+    fprintf (c2m_options->message_file, "  Promotion candidates (%d available regs, %d vars):\n",
+             max_regs, n_counts);
+    for (int i = 0; i < n_counts; i++)
+      fprintf (c2m_options->message_file, "    %s: score %d\n",
+               counts[i].name != NULL ? counts[i].name : "?", counts[i].count);
+  }
 
   /* Simple selection sort to find top candidates */
   int selected = 0;
@@ -11742,10 +12976,15 @@ static int select_promotion_candidates (c2m_ctx_t c2m_ctx, node_t *nodes, int n_
           break;
         }
       if (skip) continue;
-      /* Check variable fits in a register (integer type, not struct/array) */
-      if (counts[j].decl->decl_spec.type != NULL
-          && sljit_type_size (counts[j].decl->decl_spec.type) > (int) sizeof (sljit_sw))
-        continue;
+      /* Skip global variables (they live in data buffer, not on stack) */
+      if (is_global_decl (c2m_ctx, counts[j].decl)) continue;
+      /* Check variable fits in an integer register (scalar int type only) */
+      if (counts[j].decl->decl_spec.type != NULL) {
+        enum type_mode m = counts[j].decl->decl_spec.type->mode;
+        if (m == TM_STRUCT || m == TM_UNION || m == TM_ARR) continue;
+        if (is_float_type (counts[j].decl->decl_spec.type)) continue;  /* float uses FP regs */
+        if (sljit_type_size (counts[j].decl->decl_spec.type) > (int) sizeof (sljit_sw)) continue;
+      }
       if (best < 0 || counts[j].count > counts[best].count) best = j;
     }
     if (best < 0) break;
@@ -11753,6 +12992,9 @@ static int select_promotion_candidates (c2m_ctx_t c2m_ctx, node_t *nodes, int n_
     result[selected].stack_offset = (sljit_sw) counts[best].decl->offset;
     result[selected].reg = 0;  /* caller assigns register */
     selected++;
+    if (c2m_options->verbose_p && c2m_options->message_file != NULL)
+      fprintf (c2m_options->message_file, "    -> promoted: %s (score %d)\n",
+               counts[best].name != NULL ? counts[best].name : "?", counts[best].count);
     counts[best].count = 0;  /* Mark as used */
   }
   return selected;
@@ -11788,94 +13030,131 @@ static void gen_func_def (c2m_ctx_t c2m_ctx, node_t func_def) {
   /* Round up to pointer alignment */
   local_size = (local_size + sizeof (sljit_sw) - 1) & ~(sizeof (sljit_sw) - 1);
   if (local_size < 64) local_size = 64;  /* minimum frame */
+  gen_ctx->call_save_offset = local_size;
+  int has_call = 0, has_variadic_extern = 0;
+  scan_calls (c2m_ctx, block, &has_call, &has_variadic_extern);
+  int call_arg_slots = has_variadic_extern ? 10 : has_call ? 4 : 0;
+  gen_ctx->call_arg_slots = call_arg_slots;
+  /* Allocate: arg slots + 1 func ptr slot (if any calls exist) */
+  local_size += (call_arg_slots + (has_call ? 1 : 0)) * (sljit_sw) sizeof (sljit_sw);
+  gen_ctx->call_ret_base = local_size;
+  local_size += 8 * (sljit_sw) sizeof (sljit_sw); /* return value saves for nested calls */
   gen_ctx->local_size = local_size;
 
-  /* Count parameters */
+  /* Count parameters and collect types */
   int nargs = 0;
+  struct type *param_types[4] = {NULL, NULL, NULL, NULL};
   if (ft->param_list != NULL) {
-    for (node_t param = NL_HEAD (ft->param_list->u.ops); param != NULL; param = NL_NEXT (param)) {
-      if (param->code == N_DOTS) break;
-      /* Skip void parameter: int f(void) has one param node but means 0 args */
-      decl_t pd = param->attr;
-      if (pd != NULL && pd->decl_spec.type != NULL && pd->decl_spec.type->mode == TM_BASIC
-          && pd->decl_spec.type->u.basic_type == TP_VOID)
-        break;
-      nargs++;
+    node_t first_param = NL_HEAD (ft->param_list->u.ops);
+    if (!void_param_p (first_param)) {
+      for (node_t param = first_param; param != NULL; param = NL_NEXT (param)) {
+        if (param->code == N_DOTS) break;
+        if (nargs < 4) {
+          decl_t pd = param->attr;
+          param_types[nargs] = pd != NULL ? pd->decl_spec.type : NULL;
+        }
+        nargs++;
+      }
     }
   }
   if (nargs > 4) nargs = 4;  /* sljit supports up to ~4 word args directly */
 
-  /* Build arg_types for sljit — all args are word-sized integers for now */
-  sljit_s32 arg_types = 0;
-  switch (nargs) {
-  case 0: arg_types = SLJIT_ARGS0 (W); break;
-  case 1: arg_types = SLJIT_ARGS1 (W, W); break;
-  case 2: arg_types = SLJIT_ARGS2 (W, W, W); break;
-  case 3: arg_types = SLJIT_ARGS3 (W, W, W, W); break;
-  case 4: arg_types = SLJIT_ARGS4 (W, W, W, W, W); break;
-  }
+  /* Build arg_types for sljit with proper float/int type info */
+  sljit_s32 arg_types = build_arg_types (ft->ret_type, param_types, nargs);
 
   /* ---- Function-level register allocation ---- */
   gen_ctx->n_reg_vars = 0;
   gen_ctx->assign_dest = 0;
+  gen_ctx->n_labels = 0;
+  gen_ctx->func_returns_float = is_float_type (ft->ret_type);
+  gen_ctx->func_returns_f32 = is_f32_type (ft->ret_type);
 
-  /* Step 1: Assign params to saved registers S0..S(nargs-1).
-     sljit delivers args in S0..S3.  Params that need addr_p are spilled later. */
+  /* Step 1: Assign integer params to saved registers S0..S(n-1).
+     sljit delivers integer args in S0..S3, float args in FR0..FR3.
+     Float params are always spilled to stack. Integer params stay in saved regs
+     unless they need addr_p. */
   decl_t param_decls_arr[4] = {NULL, NULL, NULL, NULL};
   int param_needs_spill[4] = {0, 0, 0, 0};
-  if (ft->param_list != NULL) {
-    int param_idx = 0;
-    for (node_t param = NL_HEAD (ft->param_list->u.ops);
-         param != NULL && param_idx < nargs; param = NL_NEXT (param), param_idx++) {
-      if (param->code == N_DOTS) break;
-      decl_t param_decl = param->attr;
-      if (param_decl == NULL) continue;
-      param_decls_arr[param_idx] = param_decl;
-      if (!param_decl->addr_p) {
-        /* Promote this param to stay in its saved register */
-        gen_ctx->reg_vars[gen_ctx->n_reg_vars].decl = param_decl;
-        gen_ctx->reg_vars[gen_ctx->n_reg_vars].reg = SLJIT_S0 - param_idx;
-        gen_ctx->reg_vars[gen_ctx->n_reg_vars].stack_offset = (sljit_sw) param_decl->offset;
-        gen_ctx->n_reg_vars++;
-      } else {
-        param_needs_spill[param_idx] = 1;
+  int param_is_float[4] = {0, 0, 0, 0};
+  int param_float_idx[4] = {0, 0, 0, 0}; /* FR index for float params */
+  int param_int_idx[4] = {0, 0, 0, 0};   /* S index for int params */
+  {
+    int int_idx = 0, flt_idx = 0;
+    if (ft->param_list != NULL) {
+      int param_idx = 0;
+      for (node_t param = NL_HEAD (ft->param_list->u.ops);
+           param != NULL && param_idx < nargs; param = NL_NEXT (param), param_idx++) {
+        if (param->code == N_DOTS) break;
+        decl_t param_decl = param->attr;
+        if (param_decl == NULL) continue;
+        param_decls_arr[param_idx] = param_decl;
+        if (param_decl->decl_spec.type != NULL
+            && is_float_type (param_decl->decl_spec.type)) {
+          param_is_float[param_idx] = 1;
+          param_float_idx[param_idx] = flt_idx++;
+          param_needs_spill[param_idx] = 1; /* always spill float params */
+        } else {
+          param_int_idx[param_idx] = int_idx;
+          if (!param_decl->addr_p) {
+            gen_ctx->reg_vars[gen_ctx->n_reg_vars].decl = param_decl;
+            gen_ctx->reg_vars[gen_ctx->n_reg_vars].reg = SLJIT_S0 - int_idx;
+            gen_ctx->reg_vars[gen_ctx->n_reg_vars].stack_offset
+              = (sljit_sw) param_decl->offset;
+            gen_ctx->n_reg_vars++;
+          } else {
+            param_needs_spill[param_idx] = 1;
+          }
+          int_idx++;
+        }
       }
     }
   }
 
+  /* Count integer params (float params don't consume saved regs) */
+  int n_int_params = 0;
+  for (int i = 0; i < nargs; i++)
+    if (!param_is_float[i]) n_int_params++;
+
   /* Step 2: Count variable accesses in function body, promote most-used locals */
   int max_saved = SLJIT_NUMBER_OF_SAVED_REGISTERS;
   if (max_saved > MAX_REG_VARS) max_saved = MAX_REG_VARS;
-  int avail_regs = max_saved - nargs;  /* saved regs not used by params */
+  int avail_regs = max_saved - n_int_params;
   if (avail_regs > 0 && block != NULL) {
     struct reg_var candidates[MAX_REG_VARS];
     node_t scan_nodes[1] = {block};
     int n_cand = select_promotion_candidates (c2m_ctx, scan_nodes, 1, candidates, avail_regs);
     for (int i = 0; i < n_cand; i++) {
-      int slot = nargs + i;  /* register index: after all param slots */
+      int slot = n_int_params + i;
       candidates[i].reg = SLJIT_S0 - slot;
       gen_ctx->reg_vars[gen_ctx->n_reg_vars++] = candidates[i];
     }
   }
 
   /* Step 3: Compute register budget */
-  int n_saved = nargs;  /* at least enough for arg delivery */
+  int n_saved = n_int_params;
   if (gen_ctx->n_reg_vars > n_saved) n_saved = gen_ctx->n_reg_vars;
-  /* Also count promoted non-param vars: they use S(nargs)..S(n_reg_vars-1),
-     but we already ensured their slots are nargs+i, so n_saved covers them. */
   int max_scratch = SLJIT_NUMBER_OF_SCRATCH_REGISTERS;
   if (max_scratch > 10) max_scratch = 10;
   gen_ctx->n_scratch_regs = max_scratch;
   gen_ctx->n_saved_regs = n_saved;
 
   /* Step 4: Emit function enter */
-  sljit_emit_enter (compiler, 0, arg_types, gen_ctx->n_scratch_regs, n_saved, local_size);
+  sljit_emit_enter (compiler, 0, arg_types,
+                    gen_ctx->n_scratch_regs | SLJIT_ENTER_FLOAT (N_FLOAT_TEMP_REGS),
+                    n_saved, local_size);
 
-  /* Step 5: Spill params that have addr_p (need stack address) */
+  /* Step 5: Spill params that need stack storage */
   for (int i = 0; i < nargs; i++) {
     if (param_needs_spill[i] && param_decls_arr[i] != NULL) {
-      sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_MEM1 (SLJIT_SP),
-                       (sljit_sw) param_decls_arr[i]->offset, SLJIT_S0 - i, 0);
+      sljit_sw off = (sljit_sw) param_decls_arr[i]->offset;
+      if (param_is_float[i]) {
+        int f32 = is_f32_type (param_decls_arr[i]->decl_spec.type);
+        sljit_emit_fop1 (compiler, f32 ? SLJIT_MOV_F32 : SLJIT_MOV_F64,
+                         SLJIT_MEM1 (SLJIT_SP), off, SLJIT_FR0 + param_float_idx[i], 0);
+      } else {
+        sljit_emit_op1 (compiler, SLJIT_MOV, SLJIT_MEM1 (SLJIT_SP), off,
+                         SLJIT_S0 - param_int_idx[i], 0);
+      }
     }
   }
 
@@ -11887,13 +13166,30 @@ static void gen_func_def (c2m_ctx_t c2m_ctx, node_t func_def) {
   gen_ctx->break_jumps = NULL;
   gen_ctx->break_jump_count = 0;
   gen_ctx->break_jump_cap = 0;
+  gen_ctx->continue_jumps = NULL;
+  gen_ctx->continue_jump_count = 0;
+  gen_ctx->continue_jump_cap = 0;
   gen_ctx->reg_cache_count = 0;
 
   /* Generate function body */
   gen_stmt (c2m_ctx, block);
 
-  /* Implicit return 0 at end (for main-like functions) */
-  sljit_emit_return (compiler, SLJIT_MOV, SLJIT_IMM, 0);
+  /* Implicit return at end of function */
+  if (ft->ret_type != NULL && ft->ret_type->mode == TM_BASIC
+      && ft->ret_type->u.basic_type == TP_VOID) {
+    sljit_emit_return_void (compiler);
+  } else if (gen_ctx->func_returns_float) {
+    sljit_s32 fr = SLJIT_FR0;
+    if (gen_ctx->func_returns_f32) {
+      sljit_emit_fset32 (compiler, fr, 0.0f);
+      sljit_emit_return (compiler, SLJIT_MOV_F32, fr, 0);
+    } else {
+      sljit_emit_fset64 (compiler, fr, 0.0);
+      sljit_emit_return (compiler, SLJIT_MOV_F64, fr, 0);
+    }
+  } else {
+    sljit_emit_return (compiler, SLJIT_MOV, SLJIT_IMM, 0);
+  }
 
   /* Generate executable code */
   void *code = sljit_generate_code (comp, 0, NULL);
@@ -11903,6 +13199,9 @@ static void gen_func_def (c2m_ctx_t c2m_ctx, node_t func_def) {
     cf.code = code;
     cf.comp = comp;
     VARR_PUSH (compiled_func_t, compiled_funcs, cf);
+    /* Fill in function slot for indirect calls */
+    struct func_slot *slot = find_func_slot (c2m_ctx, func_name);
+    if (slot != NULL) slot->code_addr = code;
   } else {
     fprintf (stderr, "c2sljit: code generation failed for %s\n", func_name);
     sljit_free_compiler (comp);
@@ -11913,6 +13212,28 @@ static void gen_func_def (c2m_ctx_t c2m_ctx, node_t func_def) {
 }
 
 /* ---- Top-level generation: walk module AST ---- */
+
+/* Pre-scan: register all function definitions in the func_slot table
+   so that forward/recursive references resolve via indirect calls. */
+static void gen_prescan (c2m_ctx_t c2m_ctx, node_t r) {
+  if (r == NULL) return;
+  switch (r->code) {
+  case N_MODULE:
+  case N_LIST:
+    for (node_t n = NL_HEAD (r->u.ops); n != NULL; n = NL_NEXT (n))
+      gen_prescan (c2m_ctx, n);
+    break;
+  case N_FUNC_DEF: {
+    node_t declarator = NL_EL (r->u.ops, 1);
+    if (declarator != NULL && declarator->code == N_DECL) {
+      const char *name = NL_HEAD (declarator->u.ops)->u.s.s;
+      add_func_slot (c2m_ctx, name);
+    }
+    break;
+  }
+  default: break;
+  }
+}
 
 static void gen_top (c2m_ctx_t c2m_ctx, node_t r) {
   if (r == NULL) return;
@@ -11926,9 +13247,50 @@ static void gen_top (c2m_ctx_t c2m_ctx, node_t r) {
   case N_FUNC_DEF:
     gen_func_def (c2m_ctx, r);
     break;
-  case N_SPEC_DECL:
-    /* Global variable or function declaration — skip for now */
+  case N_SPEC_DECL: {
+    /* Global variable declaration — allocate in data buffer */
+    decl_t decl = r->attr;
+    if (decl == NULL) break;
+    /* Skip typedefs, extern declarations, and function types */
+    if (decl->decl_spec.typedef_p || decl->decl_spec.extern_p) break;
+    struct type *type = decl->decl_spec.type;
+    if (type == NULL || type->mode == TM_FUNC) break;
+    int size = sljit_type_size (type);
+    if (size <= 0) break;
+    int align = type->align > 0 ? type->align : size;
+    if (align > 16) align = 16;
+    void *addr = data_alloc (c2m_ctx, size, align);
+    memset (addr, 0, size); /* zero-initialize */
+    /* Register in global variable table */
+    gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+    if (gen_ctx->n_globals < MAX_GLOBALS) {
+      gen_ctx->globals[gen_ctx->n_globals].decl = decl;
+      gen_ctx->globals[gen_ctx->n_globals].addr = addr;
+      gen_ctx->n_globals++;
+    }
+    /* Process initializer if present */
+    node_t initializer = NL_EL (r->u.ops, 4);
+    if (initializer != NULL && initializer->code != N_IGNORE) {
+      node_t init_expr = initializer;
+      if (initializer->code == N_INIT) init_expr = NL_EL (initializer->u.ops, 1);
+      if (init_expr != NULL && init_expr->code != N_IGNORE) {
+        struct expr *e = init_expr->attr;
+        if (e != NULL && e->const_p) {
+          /* Constant initializer: store directly */
+          if (size <= (int) sizeof (sljit_sw)) {
+            if (signed_integer_type_p (type)) {
+              sljit_sw val = e->c.i_val;
+              memcpy (addr, &val, size);
+            } else {
+              sljit_uw val = e->c.u_val;
+              memcpy (addr, &val, size);
+            }
+          }
+        }
+      }
+    }
     break;
+  }
   default: break;
   }
 }
@@ -11945,6 +13307,7 @@ static void gen_finish (c2m_ctx_t c2m_ctx) {
     if (cf->comp != NULL) sljit_free_compiler (cf->comp);
   }
   VARR_DESTROY (compiled_func_t, compiled_funcs);
+  free (gen_ctx->data_buf);
   free (gen_ctx);
   c2m_ctx->gen_ctx = NULL;
 }
@@ -11956,6 +13319,7 @@ static void gen_mir (c2m_ctx_t c2m_ctx, node_t r) {
   c2m_ctx->gen_ctx = gen_ctx = c2sljit_calloc (c2m_ctx, sizeof (struct gen_ctx));
   VARR_CREATE (compiled_func_t, compiled_funcs, alloc, 16);
 
+  gen_prescan (c2m_ctx, r);
   gen_top (c2m_ctx, r);
 }
 

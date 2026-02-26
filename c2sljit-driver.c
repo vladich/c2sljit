@@ -47,6 +47,7 @@ static void usage (const char *prog) {
            "  -fopt-mem-operands   Direct memory/imm operands\n"
            "  -fopt-reg-cache      Register caching in basic blocks\n"
            "  -fopt-strength-reduce  Strength reduction (mul/div/mod)\n"
+           "  -fopt-magic-div      Magic number division (x86-64)\n"
            "  -fopt-commute        Commutative operand swap\n"
            "  -fopt-smart-regs     Cache-aware temp reg allocation\n"
            "  -fopt-defer-store    Deferred write-back\n"
@@ -88,6 +89,8 @@ int main (int argc, char *argv[]) {
       opts.opt_cmp_branch_p = 1;
     } else if (strcmp (argv[i], "-fopt-strength-reduce") == 0) {
       opts.opt_strength_reduce_p = 1;
+    } else if (strcmp (argv[i], "-fopt-magic-div") == 0) {
+      opts.opt_magic_div_p = 1;
     } else if (strcmp (argv[i], "-fopt-commute") == 0) {
       opts.opt_commute_p = 1;
     } else if (strcmp (argv[i], "-fopt-smart-regs") == 0) {
@@ -99,6 +102,9 @@ int main (int argc, char *argv[]) {
       opts.opt_reg_cache_p = opts.opt_cmp_branch_p = 1;
       opts.opt_strength_reduce_p = opts.opt_commute_p = 1;
       opts.opt_smart_regs_p = opts.opt_defer_store_p = 1;
+#if defined(__x86_64__) || defined(_M_X64)
+      opts.opt_magic_div_p = 1;
+#endif
     } else if (strncmp (argv[i], "-D", 2) == 0) {
       const char *macro = argv[i] + 2;
       if (*macro == '\0' && i + 1 < argc) macro = argv[++i];

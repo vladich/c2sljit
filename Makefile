@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
          -Wno-sign-compare -Wno-missing-field-initializers \
-         -g -O2 -I.
+         -fno-strict-aliasing -g -O2 -I.
 LDFLAGS =
 
 # sljit source
@@ -11,10 +11,14 @@ SRCS = c2sljit.c c2sljit-driver.c $(SLJIT_SRC)
 OBJS = c2sljit.o c2sljit-driver.o sljitLir.o
 TARGET = c2sljit
 
+# dlsym needs -ldl on Linux
+UNAME_S := $(shell uname -s)
+ifneq ($(UNAME_S),Darwin)
+  LDFLAGS += -ldl
+endif
+
 # MIR project (for bench target)
 MIR_DIR = $(HOME)/Projects/mir
-# TCC project (for bench target)
-TCC_DIR = $(HOME)/Projects/tinycc
 
 .PHONY: all clean test
 
@@ -62,14 +66,14 @@ else
 endif
 
 bench.o: bench.c
-	$(CC) $(CFLAGS) -I$(MIR_DIR) -I$(MIR_DIR)/c2mir -I$(TCC_DIR) -DTCC_LIB_PATH='"$(TCC_DIR)"' -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(MIR_DIR) -I$(MIR_DIR)/c2mir -c -o $@ $<
 
 bench-c2sljit.o: c2sljit.o
 	cp $< $@
 	printf '_c2sljit_init\n_c2sljit_finish\n_c2sljit_compile\n_c2sljit_get_main\n' > /tmp/bench-exports.txt
 	nmedit -s /tmp/bench-exports.txt $@
 
-bench: bench.o bench-c2sljit.o sljitLir.o $(MIR_DIR)/libmir.a $(TCC_DIR)/libtcc.a
+bench: bench.o bench-c2sljit.o sljitLir.o $(MIR_DIR)/libmir.a
 	$(CC) $(LDFLAGS) $(BENCH_LDFLAGS) -o $@ $^ -lm
 
 clean:

@@ -24,6 +24,7 @@ struct c2sljit_options {
   int opt_reg_cache_p;       /* Opt 4: register caching within basic blocks */
   int opt_cmp_branch_p;      /* Opt 5: comparison-branch fusion */
   int opt_strength_reduce_p; /* Opt 6: strength reduction for constant mul/div/mod */
+  int opt_magic_div_p;       /* Opt 6b: magic number division (x86-64 only) */
   int opt_commute_p;         /* Opt 7: commutative operand swap */
   int opt_smart_regs_p;      /* Opt 8: cache-aware temp reg allocation */
   int opt_defer_store_p;     /* Opt 9: deferred write-back for cached vars */

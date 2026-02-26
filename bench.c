@@ -17,7 +17,6 @@
 #include "mir-gen.h"
 #include "c2mir.h"
 #include "real-time.h"
-#include "libtcc.h"
 
 /* ---- c2sljit API (manual declarations) ----
    c2sljit functions take a pointer to c2sljit's own MIR_context struct
@@ -36,7 +35,7 @@ struct c2sljit_options {
   int syntax_only_p, pedantic_p;
   int opt_mem_operands_p;
   int opt_reg_cache_p, opt_cmp_branch_p;
-  int opt_strength_reduce_p, opt_commute_p, opt_smart_regs_p, opt_defer_store_p;
+  int opt_strength_reduce_p, opt_magic_div_p, opt_commute_p, opt_smart_regs_p, opt_defer_store_p;
   size_t module_num;
   FILE *prepro_output_file;
   const char *output_file_name;
@@ -139,6 +138,9 @@ static struct bench_result run_c2sljit (const char *name, const char *source, in
     opts.opt_reg_cache_p = opts.opt_cmp_branch_p = 1;
     opts.opt_strength_reduce_p = opts.opt_commute_p = 1;
     opts.opt_smart_regs_p = opts.opt_defer_store_p = 1;
+#if defined(SLJIT_CONFIG_X86_64) && SLJIT_CONFIG_X86_64
+    opts.opt_magic_div_p = 1;
+#endif
   }
 
   struct string_getc_data sgd = {.str = source, .pos = 0};
@@ -302,51 +304,6 @@ static const char bitops_src[] =
   "  return x % 256;\n"
   "}\n";
 
-/* ---- Run benchmark via TCC (libtcc) ---- */
-
-static struct bench_result run_tcc (const char *name, const char *source) {
-  struct bench_result r = {0, 0, -1, 0};
-
-  double t0 = real_usec_time ();
-
-  TCCState *s = tcc_new ();
-  if (s == NULL) {
-    fprintf (stderr, "tcc: %s: tcc_new failed\n", name);
-    return r;
-  }
-  tcc_set_lib_path (s, TCC_LIB_PATH);
-  tcc_set_output_type (s, TCC_OUTPUT_MEMORY);
-  if (tcc_compile_string (s, source) == -1) {
-    fprintf (stderr, "tcc: %s: compilation failed\n", name);
-    tcc_delete (s);
-    return r;
-  }
-  if (tcc_relocate (s) < 0) {
-    fprintf (stderr, "tcc: %s: relocate failed\n", name);
-    tcc_delete (s);
-    return r;
-  }
-
-  int (*main_func) (int, char **) = (int (*) (int, char **)) tcc_get_symbol (s, "main");
-  double t1 = real_usec_time ();
-  r.compile_us = t1 - t0;
-
-  if (main_func == NULL) {
-    fprintf (stderr, "tcc: %s: main() not found\n", name);
-    tcc_delete (s);
-    return r;
-  }
-
-  t0 = real_usec_time ();
-  r.result = main_func (0, NULL);
-  t1 = real_usec_time ();
-  r.exec_us = t1 - t0;
-  r.ok = 1;
-
-  tcc_delete (s);
-  return r;
-}
-
 struct benchmark {
   const char *name;
   const char *source;
@@ -362,40 +319,56 @@ static struct benchmark benchmarks[] = {
 
 #define N_BENCH (sizeof (benchmarks) / sizeof (benchmarks[0]))
 
+/* Pick the run with the lowest total (compile + exec) time. */
+static struct bench_result best_of (struct bench_result *runs, int n) {
+  int best = 0;
+  for (int i = 1; i < n; i++)
+    if (runs[i].compile_us + runs[i].exec_us < runs[best].compile_us + runs[best].exec_us)
+      best = i;
+  return runs[best];
+}
+
+#define N_RUNS 5
+
 int main (void) {
-  printf ("%-16s %14s %14s %14s %14s %14s %14s %14s %14s %8s\n",
-          "Benchmark", "sljit compile", "sljit-O1 comp", "mir compile", "tcc compile",
-          "sljit-O1 exec", "mir exec", "tcc exec", "sljit/mir", "result");
-  printf ("%-16s %14s %14s %14s %14s %14s %14s %14s %14s %8s\n",
+  printf ("%-16s %14s %14s %14s %14s %14s %14s %14s %8s\n",
+          "Benchmark", "sljit compile", "sljit-O1 comp", "mir compile",
+          "sljit exec", "sljit-O1 exec", "mir exec", "sljit/mir", "result");
+  printf ("%-16s %14s %14s %14s %14s %14s %14s %14s %8s\n",
           "----------------", "--------------", "--------------", "--------------",
-          "--------------", "--------------", "--------------", "--------------",
+          "--------------", "--------------", "--------------",
           "--------------", "--------");
 
   for (size_t i = 0; i < N_BENCH; i++) {
-    struct bench_result sljit_r = run_c2sljit (benchmarks[i].name, benchmarks[i].source, 0);
-    struct bench_result sljit_o1_r = run_c2sljit (benchmarks[i].name, benchmarks[i].source, 1);
-    struct bench_result mir_r = run_c2mir (benchmarks[i].name, benchmarks[i].source);
-    struct bench_result tcc_r = run_tcc (benchmarks[i].name, benchmarks[i].source);
+    struct bench_result sljit_runs[N_RUNS], sljit_o1_runs[N_RUNS], mir_runs[N_RUNS];
+    for (int r = 0; r < N_RUNS; r++) {
+      sljit_runs[r] = run_c2sljit (benchmarks[i].name, benchmarks[i].source, 0);
+      sljit_o1_runs[r] = run_c2sljit (benchmarks[i].name, benchmarks[i].source, 1);
+      mir_runs[r] = run_c2mir (benchmarks[i].name, benchmarks[i].source);
+    }
+    struct bench_result sljit_r = best_of (sljit_runs, N_RUNS);
+    struct bench_result sljit_o1_r = best_of (sljit_o1_runs, N_RUNS);
+    struct bench_result mir_r = best_of (mir_runs, N_RUNS);
 
     double exec_ratio = mir_r.exec_us > 0 ? sljit_o1_r.exec_us / mir_r.exec_us : 0;
 
     const char *result_str;
     char result_buf[64];
-    if (!sljit_o1_r.ok || !mir_r.ok || !tcc_r.ok) {
+    if (!sljit_o1_r.ok || !mir_r.ok) {
       result_str = "FAIL";
-    } else if (sljit_o1_r.result != mir_r.result || tcc_r.result != mir_r.result) {
-      snprintf (result_buf, sizeof (result_buf), "MISMATCH %d/%d/%d",
-                sljit_o1_r.result, mir_r.result, tcc_r.result);
+    } else if (sljit_o1_r.result != mir_r.result) {
+      snprintf (result_buf, sizeof (result_buf), "MISMATCH %d/%d",
+                sljit_o1_r.result, mir_r.result);
       result_str = result_buf;
     } else {
       snprintf (result_buf, sizeof (result_buf), "%d", mir_r.result);
       result_str = result_buf;
     }
 
-    printf ("%-16s %11.0f us %11.0f us %11.0f us %11.0f us %11.0f us %11.0f us %11.0f us %7.2fx %8s\n",
+    printf ("%-16s %11.0f us %11.0f us %11.0f us %11.0f us %11.0f us %11.0f us %7.2fx %8s\n",
             benchmarks[i].name,
-            sljit_r.compile_us, sljit_o1_r.compile_us, mir_r.compile_us, tcc_r.compile_us,
-            sljit_o1_r.exec_us, mir_r.exec_us, tcc_r.exec_us, exec_ratio,
+            sljit_r.compile_us, sljit_o1_r.compile_us, mir_r.compile_us,
+            sljit_r.exec_us, sljit_o1_r.exec_us, mir_r.exec_us, exec_ratio,
             result_str);
   }
 
